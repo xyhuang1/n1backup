@@ -1,13 +1,7 @@
 import Foundation
-
-#if canImport(AMSMB2)
 import AMSMB2
-#endif
 
-/// SMB / Samba 客户端
-///
-/// 完整功能依赖 SPM 包：https://github.com/amosavian/AMSMB2
-/// Xcode → 项目 → Package Dependencies → 添加上述 URL，产品勾选 AMSMB2
+/// SMB / Samba（工程已链接 AMSMB2，直接可用）
 final class SMBStorageClient: StorageClient {
     private let server: StorageServer
     private let credentials: ServerCredentials
@@ -18,86 +12,51 @@ final class SMBStorageClient: StorageClient {
     }
 
     func testConnection() async throws {
-        #if canImport(AMSMB2)
         let manager = try makeManager()
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            manager.connectShare(name: server.normalizedShareName) { error in
-                if let error {
-                    cont.resume(throwing: StorageError.connectionFailed(error.localizedDescription))
-                } else {
-                    manager.disconnectShare()
-                    cont.resume()
-                }
-            }
+        do {
+            try await manager.connectShare(name: server.normalizedShareName)
+            defer { manager.disconnectShare() }
+            let root = server.normalizedBasePath
+            _ = try await manager.contentsOfDirectory(atPath: root.isEmpty ? "/" : root)
+        } catch {
+            throw StorageError.connectionFailed(friendly(error))
         }
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
     func remoteExists(relativePath: String) async throws -> Bool {
-        #if canImport(AMSMB2)
-        let path = server.joinedRemotePath(relativePath)
+        let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
         let manager = try makeManager()
-        return try await withCheckedThrowingContinuation { cont in
-            manager.connectShare(name: server.normalizedShareName) { error in
-                if let error {
-                    cont.resume(throwing: StorageError.connectionFailed(error.localizedDescription))
-                    return
-                }
-                manager.attributesOfItem(atPath: path) { _, error in
-                    manager.disconnectShare()
-                    if let error = error as NSError? {
-                        // 找不到文件
-                        if error.domain == NSPOSIXErrorDomain && error.code == ENOENT {
-                            cont.resume(returning: false)
-                        } else if "\(error)".lowercased().contains("not found") {
-                            cont.resume(returning: false)
-                        } else {
-                            cont.resume(returning: false)
-                        }
-                    } else {
-                        cont.resume(returning: true)
-                    }
-                }
-            }
+        do {
+            try await manager.connectShare(name: server.normalizedShareName)
+            defer { manager.disconnectShare() }
+            _ = try await manager.attributesOfItem(atPath: path)
+            return true
+        } catch {
+            return false
         }
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
     func ensureDirectories(relativeDir: String) async throws {
-        #if canImport(AMSMB2)
-        let full = server.joinedRemotePath(relativeDir)
+        let full = normalizeSMBPath(server.joinedRemotePath(relativeDir))
         let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return }
+
         let manager = try makeManager()
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            manager.connectShare(name: server.normalizedShareName) { error in
-                if let error {
-                    cont.resume(throwing: StorageError.connectionFailed(error.localizedDescription))
-                    return
+        do {
+            try await manager.connectShare(name: server.normalizedShareName)
+            defer { manager.disconnectShare() }
+            var built = ""
+            for part in parts {
+                built = built.isEmpty ? part : "\(built)/\(part)"
+                do {
+                    try await manager.createDirectory(atPath: built)
+                } catch {
+                    // 已存在
                 }
-                var built = ""
-                func createNext(_ index: Int) {
-                    if index >= parts.count {
-                        manager.disconnectShare()
-                        cont.resume()
-                        return
-                    }
-                    built = built.isEmpty ? parts[index] : built + "/" + parts[index]
-                    manager.createDirectory(atPath: built) { error in
-                        // 已存在忽略
-                        _ = error
-                        createNext(index + 1)
-                    }
-                }
-                createNext(0)
             }
+        } catch {
+            throw StorageError.remote(friendly(error))
         }
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
     func uploadFile(
@@ -106,50 +65,55 @@ final class SMBStorageClient: StorageClient {
         contentType: String?,
         progress: ((Double) -> Void)?
     ) async throws {
-        #if canImport(AMSMB2)
         let parent = (relativePath as NSString).deletingLastPathComponent
         if !parent.isEmpty && parent != "." {
             try await ensureDirectories(relativeDir: parent)
         }
-        let path = server.joinedRemotePath(relativePath)
-        let data = try Data(contentsOf: localURL)
-        let total = Double(data.count)
-        let manager = try makeManager()
 
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            manager.connectShare(name: server.normalizedShareName) { error in
-                if let error {
-                    cont.resume(throwing: StorageError.connectionFailed(error.localizedDescription))
-                    return
-                }
-                manager.write(data: data, progress: { bytes in
-                    if total > 0 { progress?(Double(bytes) / total) }
+        let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
+        let data = try Data(contentsOf: localURL)
+        let total = max(Double(data.count), 1)
+
+        let manager = try makeManager()
+        do {
+            try await manager.connectShare(name: server.normalizedShareName)
+            defer { manager.disconnectShare() }
+
+            try await manager.write(
+                data: data,
+                progress: { sent in
+                    progress?(min(Double(sent) / total, 1))
                     return true
-                }, toPath: path) { error in
-                    manager.disconnectShare()
-                    if let error {
-                        cont.resume(throwing: StorageError.remote(error.localizedDescription))
-                    } else {
-                        progress?(1)
-                        cont.resume()
-                    }
-                }
-            }
+                },
+                toPath: path
+            )
+            progress?(1)
+        } catch {
+            throw StorageError.remote(friendly(error))
         }
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
-    #if canImport(AMSMB2)
+    // MARK: -
+
     private func makeManager() throws -> SMB2Manager {
-        guard !server.normalizedShareName.isEmpty else {
-            throw StorageError.invalidConfiguration("SMB 共享名不能为空")
-        }
         let host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: "smb://\(host)") else {
-            throw StorageError.invalidConfiguration("SMB 主机无效")
+        guard !host.isEmpty else {
+            throw StorageError.invalidConfiguration("主机不能为空")
         }
+        guard !server.normalizedShareName.isEmpty else {
+            throw StorageError.invalidConfiguration("请填写 SMB 共享名（iStoreOS Samba 里配置的名称，如 sda1）")
+        }
+
+        var components = URLComponents()
+        components.scheme = "smb"
+        components.host = host
+        if server.port > 0, server.port != 445 {
+            components.port = server.port
+        }
+        guard let url = components.url else {
+            throw StorageError.invalidConfiguration("SMB 地址无效")
+        }
+
         let credential = URLCredential(
             user: composedUsername(),
             password: credentials.password,
@@ -158,23 +122,36 @@ final class SMBStorageClient: StorageClient {
         guard let manager = SMB2Manager(url: url, credential: credential) else {
             throw StorageError.connectionFailed("无法创建 SMB 连接")
         }
+        manager.timeout = 120
         return manager
     }
 
     private func composedUsername() -> String {
-        let user = server.username
+        let user = server.username.trimmingCharacters(in: .whitespacesAndNewlines)
         let domain = server.domain.trimmingCharacters(in: .whitespacesAndNewlines)
-        if domain.isEmpty { return user }
-        // DOMAIN\user 形式
-        if user.contains("\\") { return user }
+        if domain.isEmpty || user.contains("\\") { return user }
         return "\(domain)\\\(user)"
     }
-    #endif
 
-    static let dependencyHint = """
-    SMB 需要添加 Swift 包 AMSMB2：
-    Xcode → Project → Package Dependencies
-    URL: https://github.com/amosavian/AMSMB2
-    然后重新编译。
-    """
+    private func normalizeSMBPath(_ path: String) -> String {
+        path.replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
+    }
+
+    private func friendly(_ error: Error) -> String {
+        let msg = error.localizedDescription
+        if msg.localizedCaseInsensitiveContains("auth") || msg.localizedCaseInsensitiveContains("logon") {
+            return "认证失败：检查 Samba 用户名/密码，以及是否允许该用户访问共享"
+        }
+        if msg.localizedCaseInsensitiveContains("timed out") || msg.localizedCaseInsensitiveContains("timeout") {
+            return "连接超时：确认 445 端口开放，手机与 N1 同一 Wi‑Fi"
+        }
+        if msg.localizedCaseInsensitiveContains("not found") || msg.localizedCaseInsensitiveContains("no such") {
+            return "共享或路径不存在：检查「共享名」与「共享内路径」"
+        }
+        return msg
+    }
 }

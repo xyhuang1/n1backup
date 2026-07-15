@@ -216,21 +216,10 @@ struct ServerEditView: View {
     }
 
     private var optionsSection: some View {
-        Section("依赖说明") {
-            switch server.protocolKind {
-            case .webdav, .ftp:
-                Label("系统自带 URLSession，无需额外库", systemImage: "checkmark.seal")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            case .smb:
-                Text(SMBStorageClient.dependencyHint)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            case .sftp:
-                Text(SFTPStorageClient.dependencyHint)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+        Section("状态") {
+            Label("WebDAV / SMB / SFTP / FTP 均已内置，填好参数即可测试连接", systemImage: "checkmark.seal.fill")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -280,30 +269,29 @@ struct ServerEditView: View {
         case .webdav:
             return [
                 "主机：N1 局域网 IP",
-                "端口：Alist 默认 5244，bytemark/webdav 常用 8080",
+                "端口：Alist 默认 5244，docker webdav 常用 8080",
                 "用户名/密码：WebDAV 服务账号",
-                "基础路径：必须是 WebDAV 可写目录"
+                "基础路径：必须是可写目录"
             ]
         case .smb:
             return [
                 "主机：N1 IP，端口一般 445",
-                "共享名：Luci Samba 里配置的共享名称",
-                "用户名/密码：Samba 用户（或 guest 空密码）",
-                "需添加 AMSMB2 Swift 包"
+                "共享名：必填，Luci → Samba 里的共享名",
+                "用户名/密码：Samba 用户",
+                "共享内路径：如 PhoneBackup（可空）"
             ]
         case .sftp:
             return [
-                "主机：N1 IP，端口 22（或你改过的 SSH 端口）",
-                "用户名/密码：系统 SSH 用户",
-                "或粘贴私钥（openssh/pem）",
-                "基础路径：USB 挂载点，如 /mnt/sda1/PhoneBackup",
-                "需添加 Citadel Swift 包"
+                "主机：N1 IP，端口 22",
+                "用户名/密码：SSH 登录账号（推荐密码）",
+                "基础路径：如 /mnt/sda1/PhoneBackup",
+                "请确认该用户对目录有写权限"
             ]
         case .ftp:
             return [
                 "主机 + 端口（默认 21）",
                 "建议被动模式；FTPS 打开 TLS",
-                "部分路由器 FTP 实现有兼容性差异，优先 WebDAV/SFTP"
+                "兼容性一般，优先 WebDAV / SMB / SFTP"
             ]
         }
     }

@@ -193,7 +193,7 @@ struct HomeView: View {
                 .font(.headline)
             tipRow("先在设置中「新建连接」，选协议并填写主机/账号/路径")
             tipRow("可保存多台服务器，主页可切换当前目标")
-            tipRow("WebDAV 开箱即用；SMB/SFTP 需在 Xcode 添加对应 Swift 包")
+            tipRow("WebDAV / SMB / SFTP / FTP 均已内置，填好服务器信息即可")
             tipRow("大量备份请插电并保持 App 前台")
         }
         .frame(maxWidth: .infinity, alignment: .leading)

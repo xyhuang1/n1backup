@@ -167,6 +167,13 @@ jobs:
           test -d N1PhotoBackup.xcodeproj
           ls -la N1PhotoBackup.xcodeproj
 
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project N1PhotoBackup.xcodeproj \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath build/SourcePackages
+
       - name: Archive
         run: |
           set -euo pipefail
@@ -178,6 +185,7 @@ jobs:
             -configuration Release \
             -archivePath "build/${APP_NAME}.xcarchive" \
             -destination "generic/platform=iOS" \
+            -clonedSourcePackagesDirPath build/SourcePackages \
             -allowProvisioningUpdates \
             DEVELOPMENT_TEAM="$TEAM_ID" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \

@@ -1,17 +1,8 @@
 import Foundation
-
-#if canImport(Citadel)
 import Citadel
-import NIO
-#endif
+import NIOCore
 
-/// SFTP 客户端
-///
-/// 依赖 SPM：https://github.com/orlandos-nl/Citadel
-/// Xcode → Package Dependencies → 添加后勾选 Citadel
-///
-/// 当前实现以**密码登录**为主（兼容性最好）。
-/// 私钥登录：打开「使用 SSH 私钥」后，若 Citadel 版本支持将尝试 RSA PEM；否则请改用密码或 ssh-copy-id 后的密钥代理方案。
+/// SFTP 客户端（Citadel，工程已通过 SPM 链接，开箱即用）
 final class SFTPStorageClient: StorageClient {
     private let server: StorageServer
     private let credentials: ServerCredentials
@@ -22,51 +13,45 @@ final class SFTPStorageClient: StorageClient {
     }
 
     func testConnection() async throws {
-        #if canImport(Citadel)
-        let client = try await connect()
-        defer { closeQuietly(client) }
-        _ = try await client.openSFTP()
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
+        try await withSFTP { sftp in
+            let path = self.server.normalizedBasePath
+            // 列一下基础目录；不存在时尝试列 /
+            do {
+                _ = try await sftp.listDirectory(atPath: path.isEmpty ? "/" : path)
+            } catch {
+                _ = try await sftp.listDirectory(atPath: "/")
+            }
+        }
     }
 
     func remoteExists(relativePath: String) async throws -> Bool {
-        #if canImport(Citadel)
         let path = server.joinedRemotePath(relativePath)
-        let client = try await connect()
-        defer { closeQuietly(client) }
-        let sftp = try await client.openSFTP()
-        do {
-            _ = try await sftp.getAttributes(at: path)
-            return true
-        } catch {
-            return false
+        return try await withSFTP { sftp in
+            do {
+                _ = try await sftp.getAttributes(at: path)
+                return true
+            } catch {
+                return false
+            }
         }
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
     func ensureDirectories(relativeDir: String) async throws {
-        #if canImport(Citadel)
         let full = server.joinedRemotePath(relativeDir)
         let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-        let client = try await connect()
-        defer { closeQuietly(client) }
-        let sftp = try await client.openSFTP()
-        var built = ""
-        for part in parts {
-            built += "/" + part
-            do {
-                try await sftp.createDirectory(atPath: built)
-            } catch {
-                // 目录已存在等错误忽略
+        guard !parts.isEmpty else { return }
+
+        try await withSFTP { sftp in
+            var built = ""
+            for part in parts {
+                built += "/" + part
+                do {
+                    try await sftp.createDirectory(atPath: built)
+                } catch {
+                    // 已存在
+                }
             }
         }
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
     func uploadFile(
@@ -75,70 +60,101 @@ final class SFTPStorageClient: StorageClient {
         contentType: String?,
         progress: ((Double) -> Void)?
     ) async throws {
-        #if canImport(Citadel)
         let parent = (relativePath as NSString).deletingLastPathComponent
         if !parent.isEmpty && parent != "." {
             try await ensureDirectories(relativeDir: parent)
         }
+
         let path = server.joinedRemotePath(relativePath)
         let fileData = try Data(contentsOf: localURL)
         progress?(0.05)
 
-        let client = try await connect()
-        defer { closeQuietly(client) }
-        let sftp = try await client.openSFTP()
-
-        // Citadel API：写入完整文件
-        try await sftp.withFile(
-            filePath: path,
-            flags: [.create, .write, .truncate]
-        ) { file in
-            try await file.write(ByteBuffer(data: fileData))
+        try await withSFTP { sftp in
+            try await sftp.withFile(
+                filePath: path,
+                flags: [.write, .create, .truncate]
+            ) { file in
+                var buffer = ByteBufferAllocator().buffer(capacity: fileData.count)
+                buffer.writeBytes(fileData)
+                try await file.write(buffer)
+            }
         }
         progress?(1)
-        #else
-        throw StorageError.notAvailable(Self.dependencyHint)
-        #endif
     }
 
-    #if canImport(Citadel)
-    private func connect() async throws -> SSHClient {
-        let host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        let user = server.username
+    // MARK: - Connection
 
-        // 密码登录（最稳）
-        // 若启用了私钥但未填密码，给出明确错误，避免静默失败
-        if server.usePrivateKey && credentials.password.isEmpty && credentials.privateKey.isEmpty {
-            throw StorageError.invalidConfiguration("请填写密码，或粘贴私钥（并保留密码作备用）")
+    private func withSFTP<T: Sendable>(
+        _ body: @Sendable (SFTPClient) async throws -> T
+    ) async throws -> T {
+        let host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty else {
+            throw StorageError.invalidConfiguration("主机不能为空")
+        }
+        let user = server.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !user.isEmpty else {
+            throw StorageError.invalidConfiguration("SFTP 用户名不能为空")
         }
 
+        // 私钥登录：Citadel 版本差异大，优先密码；有私钥且密码为空时给出明确提示
+        if server.usePrivateKey, credentials.password.isEmpty, !credentials.privateKey.isEmpty {
+            throw StorageError.invalidConfiguration(
+                "当前版本优先支持密码登录。请关闭「使用 SSH 私钥」，填写 SSH 密码后重试（或在 N1 上为该用户设置密码）。"
+            )
+        }
+        if credentials.password.isEmpty {
+            throw StorageError.invalidConfiguration("请填写 SSH/SFTP 密码")
+        }
+
+        let port = server.port > 0 ? server.port : 22
         let auth = SSHAuthenticationMethod.passwordBased(
             username: user,
             password: credentials.password
         )
 
+        let ssh: SSHClient
         do {
-            return try await SSHClient.connect(
+            ssh = try await SSHClient.connect(
                 host: host,
-                port: server.port,
+                port: port,
                 authenticationMethod: auth,
                 hostKeyValidator: .acceptAnything(),
                 reconnect: .never
             )
         } catch {
-            throw StorageError.connectionFailed(error.localizedDescription)
+            throw StorageError.connectionFailed(friendly(error))
+        }
+
+        do {
+            let sftp = try await ssh.openSFTP()
+            do {
+                let result = try await body(sftp)
+                try? await ssh.close()
+                return result
+            } catch {
+                try? await ssh.close()
+                throw StorageError.remote(friendly(error))
+            }
+        } catch let e as StorageError {
+            try? await ssh.close()
+            throw e
+        } catch {
+            try? await ssh.close()
+            throw StorageError.connectionFailed(friendly(error))
         }
     }
 
-    private func closeQuietly(_ client: SSHClient) {
-        try? client.close()
+    private func friendly(_ error: Error) -> String {
+        let msg = error.localizedDescription
+        if msg.localizedCaseInsensitiveContains("auth")
+            || msg.localizedCaseInsensitiveContains("permission")
+            || msg.localizedCaseInsensitiveContains("denied") {
+            return "认证失败或无权限：请检查用户名/密码，以及目录写权限"
+        }
+        if msg.localizedCaseInsensitiveContains("timed out")
+            || msg.localizedCaseInsensitiveContains("timeout") {
+            return "连接超时：确认 N1 SSH 已开启，端口正确，与手机同一局域网"
+        }
+        return msg
     }
-    #endif
-
-    static let dependencyHint = """
-    SFTP 需要添加 Swift 包 Citadel：
-    Xcode → Project → Package Dependencies
-    URL: https://github.com/orlandos-nl/Citadel
-    添加后重新编译。推荐使用「用户名 + 密码」登录。
-    """
 }

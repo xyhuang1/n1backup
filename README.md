@@ -6,12 +6,14 @@
 
 新建连接时**自选协议**，并填写该协议需要的授权信息：
 
-| 协议 | 典型场景 | 授权字段 | 依赖 |
+| 协议 | 典型场景 | 授权字段 | 实现 |
 |------|----------|----------|------|
-| **WebDAV** | Alist / Nextcloud / docker webdav | 主机、端口、HTTPS、用户、密码、基础路径 | 系统自带 |
-| **SMB / Samba** | iStoreOS Samba 共享 | 主机、端口、共享名、用户、密码、域/工作组、共享内路径 | [AMSMB2](https://github.com/amosavian/AMSMB2) |
-| **SFTP** | OpenSSH / dropbear | 主机、端口、用户、密码或私钥、基础路径 | [Citadel](https://github.com/orlandos-nl/Citadel) |
-| **FTP / FTPS** | vsftpd 等 | 主机、端口、TLS、用户、密码、路径、被动模式 | 系统自带 |
+| **WebDAV** | Alist / Nextcloud / docker webdav | 主机、端口、HTTPS、用户、密码、基础路径 | 系统 URLSession（内置） |
+| **SMB / Samba** | iStoreOS Samba 共享 | 主机、端口、共享名、用户、密码、域、共享内路径 | AMSMB2（工程已集成） |
+| **SFTP** | OpenSSH / dropbear | 主机、端口、用户、密码、基础路径 | Citadel（工程已集成） |
+| **FTP / FTPS** | vsftpd 等 | 主机、端口、TLS、用户、密码、路径 | 系统 URLSession（内置） |
+
+四种协议 **均已接好**，无需再手动「添加 Swift 包」。CI / `xcodegen` 会自动拉取依赖。
 
 - 可保存**多台**服务器，备份前切换「当前目标」
 - 密码 / 私钥存 **Keychain**
@@ -94,17 +96,6 @@ HTTPS: 关
 
 详见 [XCODE_SETUP.md](./XCODE_SETUP.md)。最低 **iOS 17**。  
 也可用 `brew install xcodegen && xcodegen generate` 直接生成 `.xcodeproj`。
-
-### 可选 Swift 包（SMB / SFTP）
-
-**File → Add Package Dependencies…**
-
-| 协议 | URL |
-|------|-----|
-| SMB | `https://github.com/amosavian/AMSMB2` |
-| SFTP | `https://github.com/orlandos-nl/Citadel` |
-
-未添加时，选对应协议点「测试连接」会提示需要依赖；WebDAV / FTP 不受影响。
 
 ### Info 权限
 

@@ -57,18 +57,30 @@ jobs:
           xcodegen generate
           test -d N1PhotoBackup.xcodeproj
 
+      - name: Resolve Swift packages (AMSMB2 + Citadel)
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project N1PhotoBackup.xcodeproj \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath build/SourcePackages
+          echo "✓ Packages resolved"
+
       - name: Build (no code sign)
         run: |
           set -euo pipefail
           mkdir -p build
 
           # 关闭签名，仅编译 arm64 真机包（牛蛙等工具会再签）
+          # 已链接 AMSMB2(SMB) + Citadel(SFTP)，WebDAV/FTP 系统自带
           xcodebuild build \
             -project N1PhotoBackup.xcodeproj \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination "generic/platform=iOS" \
             -derivedDataPath build/DerivedData \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -disableAutomaticPackageResolution \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \

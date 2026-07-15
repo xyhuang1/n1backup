@@ -1,6 +1,5 @@
-# XcodeGen 工程定义
-# CI: brew install xcodegen && xcodegen generate
-# 本地 Mac 同样可用
+# XcodeGen 工程 —— 已内置 SMB / SFTP 依赖，无需再手动加包
+# 生成: xcodegen generate
 
 name: N1PhotoBackup
 
@@ -11,13 +10,22 @@ options:
   createIntermediateGroups: true
   groupSortPosition: top
 
+# 正式接入第三方库（编译时自动下载）
+packages:
+  AMSMB2:
+    url: https://github.com/amosavian/AMSMB2
+    from: 4.0.0
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel
+    from: 0.9.0
+
 settings:
   base:
-    SWIFT_VERSION: "5.0"
+    SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     CURRENT_PROJECT_VERSION: "1"
-    MARKETING_VERSION: "1.1.0"
+    MARKETING_VERSION: "1.2.0"
     CODE_SIGN_STYLE: Manual
     ENABLE_USER_SCRIPT_SANDBOXING: false
     CLANG_ENABLE_MODULES: YES
@@ -34,6 +42,11 @@ targets:
       - path: N1PhotoBackup
         excludes:
           - "**/.DS_Store"
+    dependencies:
+      - package: AMSMB2
+        product: AMSMB2
+      - package: Citadel
+        product: Citadel
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.n1backup.photobackup
@@ -44,16 +57,14 @@ targets:
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: YES
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         CODE_SIGN_ENTITLEMENTS: N1PhotoBackup.entitlements
-        # 没有 Assets.xcassets / AppIcon 时避免打包失败
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        # 部分 SPM 包需要
+        OTHER_LDFLAGS: "$(inherited) -ObjC"
       configs:
         Debug:
           CODE_SIGN_IDENTITY: "Apple Development"
         Release:
-          CODE_SIGN_IDENTITY: "iPhone Distribution"
-    scheme:
-      testTargets: []
-      gatherCoverageData: false
+          CODE_SIGN_IDENTITY: "Apple Distribution"
 
 schemes:
   N1PhotoBackup:

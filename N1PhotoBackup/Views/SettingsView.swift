@@ -49,9 +49,9 @@ struct SettingsView: View {
                 Section("N1 / iStoreOS") {
                     VStack(alignment: .leading, spacing: 8) {
                         tip("USB 在 DiskMan 挂载后，用 Samba / Alist / SSH / FTP 任一暴露")
-                        tip("WebDAV：Docker Alist 或 bytemark/webdav（推荐，无需第三方库）")
-                        tip("SMB：开启 luci-app-samba4，App 需 AMSMB2 包")
-                        tip("SFTP：系统自带 dropbear/openssh，App 需 Citadel 包")
+                        tip("WebDAV：Docker Alist 或 bytemark/webdav")
+                        tip("SMB：Luci 开启 Samba，填共享名即可（已内置）")
+                        tip("SFTP：系统 SSH，填用户密码与 /mnt/... 路径即可（已内置）")
                     }
                     .padding(.vertical, 4)
                 }
