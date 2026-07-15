@@ -1,0 +1,35 @@
+# Xcode / macOS
+.DS_Store
+DerivedData/
+build/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/
+!*.xcodeproj/project.pbxproj
+*.xcworkspace/
+.swiftpm/
+
+# 本地生成的工程（CI 用 xcodegen 现生成）
+N1PhotoBackup.xcodeproj/
+
+# Secrets —— 千万别提交
+secrets-out/
+*.p12
+*.cer
+*.mobileprovision
+*.pem
+*.key
+ExportOptions.plist
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 杂项
+*.log
+.HBuilderx/
+node_modules/

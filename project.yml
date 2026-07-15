@@ -1,0 +1,66 @@
+# XcodeGen 工程定义
+# CI: brew install xcodegen && xcodegen generate
+# 本地 Mac 同样可用
+
+name: N1PhotoBackup
+
+options:
+  bundleIdPrefix: com.n1backup
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.1.0"
+    CODE_SIGN_STYLE: Manual
+    ENABLE_USER_SCRIPT_SANDBOXING: false
+    CLANG_ENABLE_MODULES: YES
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  N1PhotoBackup:
+    type: application
+    platform: iOS
+    sources:
+      - path: N1PhotoBackup
+        excludes:
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.n1backup.photobackup
+        PRODUCT_NAME: N1PhotoBackup
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: false
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        CODE_SIGN_ENTITLEMENTS: N1PhotoBackup.entitlements
+        # 没有 Assets.xcassets / AppIcon 时避免打包失败
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+      configs:
+        Debug:
+          CODE_SIGN_IDENTITY: "Apple Development"
+        Release:
+          CODE_SIGN_IDENTITY: "iPhone Distribution"
+    scheme:
+      testTargets: []
+      gatherCoverageData: false
+
+schemes:
+  N1PhotoBackup:
+    build:
+      targets:
+        N1PhotoBackup: all
+    run:
+      config: Debug
+    archive:
+      config: Release

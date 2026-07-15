@@ -1,0 +1,237 @@
+# GitHub Actions：在云端 Mac 编译并导出 IPA
+# 使用：仓库 Actions → Build IPA → Run workflow
+# Secrets 说明：docs/GITHUB_ACTIONS_IPA.md
+
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "导出方式（须与描述文件类型一致）"
+        required: true
+        default: development
+        type: choice
+        options:
+          - development
+          - ad-hoc
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Archive & Export IPA
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    env:
+      APP_NAME: N1PhotoBackup
+      SCHEME: N1PhotoBackup
+      BUNDLE_ID: ${{ secrets.APPLE_BUNDLE_ID }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      PROFILE_NAME: ${{ secrets.PROVISIONING_PROFILE_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          # 优先较新 Xcode，失败则用默认
+          for p in \
+            /Applications/Xcode_16.2.app \
+            /Applications/Xcode_16.1.app \
+            /Applications/Xcode_16.0.app \
+            /Applications/Xcode_15.4.app \
+            /Applications/Xcode.app
+          do
+            if [ -d "$p" ]; then
+              sudo xcode-select -s "$p/Contents/Developer"
+              break
+            fi
+          done
+          xcodebuild -version
+          swift --version
+
+      - name: Install tools
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen --version
+
+      - name: Check required secrets
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERT_PWD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROV_B64: ${{ secrets.APPLE_PROVISION_BASE64 }}
+        run: |
+          set -e
+          fail=0
+          [ -n "$TEAM_ID" ] || { echo "❌ 缺少 Secret: APPLE_TEAM_ID"; fail=1; }
+          [ -n "$CERT_B64" ] || { echo "❌ 缺少 Secret: APPLE_CERTIFICATE_BASE64"; fail=1; }
+          [ -n "$CERT_PWD" ] || { echo "❌ 缺少 Secret: APPLE_CERTIFICATE_PASSWORD"; fail=1; }
+          [ -n "$PROV_B64" ] || { echo "❌ 缺少 Secret: APPLE_PROVISION_BASE64"; fail=1; }
+          [ -n "$PROFILE_NAME" ] || { echo "❌ 缺少 Secret: PROVISIONING_PROFILE_NAME"; fail=1; }
+
+          if [ -z "$BUNDLE_ID" ]; then
+            echo "⚠️ APPLE_BUNDLE_ID 未设置，使用默认 com.n1backup.photobackup"
+            echo "BUNDLE_ID=com.n1backup.photobackup" >> "$GITHUB_ENV"
+          else
+            echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "请阅读 docs/GITHUB_ACTIONS_IPA.md 配置 Secrets"
+            exit 1
+          fi
+
+          METHOD="${{ github.event.inputs.export_method }}"
+          if [ -z "$METHOD" ]; then
+            METHOD="${{ secrets.EXPORT_METHOD }}"
+          fi
+          if [ -z "$METHOD" ]; then
+            METHOD="development"
+          fi
+          echo "EXPORT_METHOD=$METHOD" >> "$GITHUB_ENV"
+
+          echo "✓ Team=$TEAM_ID  Method=$METHOD  Profile=$PROFILE_NAME"
+
+      - name: Import signing assets
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROVISION_BASE64: ${{ secrets.APPLE_PROVISION_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC_PASS="${KEYCHAIN_PASSWORD:-ci-temp-keychain-n1}"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          PP_PATH="$RUNNER_TEMP/app.mobileprovision"
+          KC_PATH="$RUNNER_TEMP/signing.keychain-db"
+
+          echo "$CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$PROVISION_BASE64" | base64 --decode > "$PP_PATH"
+
+          security delete-keychain "$KC_PATH" 2>/dev/null || true
+          security create-keychain -p "$KC_PASS" "$KC_PATH"
+          security set-keychain-settings -lut 21600 "$KC_PATH"
+          security unlock-keychain -p "$KC_PASS" "$KC_PATH"
+          security import "$CERT_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KC_PATH"
+          security list-keychain -d user -s "$KC_PATH" login.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC_PATH"
+
+          # 解析 UUID 并安装描述文件
+          PP_XML=$(security cms -D -i "$PP_PATH")
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$PP_XML")
+          NAME_IN_FILE=$(/usr/libexec/PlistBuddy -c 'Print Name' /dev/stdin <<< "$PP_XML")
+          echo "Profile UUID=$UUID"
+          echo "Profile Name in file=$NAME_IN_FILE"
+          echo "（Secret 里的 PROVISIONING_PROFILE_NAME 应与上面 Name 一致，当前为: $PROFILE_NAME）"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PP_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+
+      - name: Prepare ExportOptions & Bundle ID
+        run: |
+          set -euo pipefail
+          # 替换 project.yml 默认 Bundle ID
+          python3 - <<'PY'
+          import os, pathlib
+          bid = os.environ["BUNDLE_ID"]
+          p = pathlib.Path("project.yml")
+          text = p.read_text(encoding="utf-8")
+          text = text.replace("com.n1backup.photobackup", bid)
+          p.write_text(text, encoding="utf-8")
+          print("project.yml bundle id ->", bid)
+          PY
+
+          if [ "$EXPORT_METHOD" = "ad-hoc" ]; then
+            cp ExportOptions-ad-hoc.plist ExportOptions.plist
+            echo "SIGN_IDENTITY=Apple Distribution" >> "$GITHUB_ENV"
+          else
+            cp ExportOptions-development.plist ExportOptions.plist
+            echo "SIGN_IDENTITY=Apple Development" >> "$GITHUB_ENV"
+          fi
+
+          /usr/libexec/PlistBuddy -c "Set :teamID $TEAM_ID" ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Delete :provisioningProfiles" ExportOptions.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$BUNDLE_ID string $PROFILE_NAME" ExportOptions.plist
+          echo "---- ExportOptions ----"
+          cat ExportOptions.plist
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          test -d N1PhotoBackup.xcodeproj
+          ls -la N1PhotoBackup.xcodeproj
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          set -o pipefail
+          xcodebuild archive \
+            -project N1PhotoBackup.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath "build/${APP_NAME}.xcarchive" \
+            -destination "generic/platform=iOS" \
+            -allowProvisioningUpdates \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            2>&1 | tee build/archive.log
+
+          test -d "build/${APP_NAME}.xcarchive"
+          echo "✓ Archive 成功"
+
+      - name: Export IPA
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "build/${APP_NAME}.xcarchive" \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions.plist \
+            2>&1 | tee build/export.log
+
+          IPA=$(find build/export -name "*.ipa" | head -n1)
+          if [ -z "$IPA" ]; then
+            echo "未找到 ipa，export 目录："
+            ls -laR build/export || true
+            exit 1
+          fi
+          cp "$IPA" "build/${APP_NAME}.ipa"
+          ls -lh "build/${APP_NAME}.ipa"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: N1PhotoBackup-ipa
+          path: |
+            build/N1PhotoBackup.ipa
+            build/export/
+            build/archive.log
+            build/export.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### N1 Photo Backup IPA"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|----|----|"
+            echo "| Bundle ID | \`${BUNDLE_ID:-?}\` |"
+            echo "| Team | \`${TEAM_ID:-?}\` |"
+            echo "| Method | \`${EXPORT_METHOD:-?}\` |"
+            echo "| Profile | \`${PROFILE_NAME:-?}\` |"
+            echo ""
+            echo "成功后到本页面 **Artifacts → N1PhotoBackup-ipa** 下载。"
+            echo "安装工具：Sideloadly / 爱思助手（设备 UDID 须在描述文件内）。"
+          } >> "$GITHUB_STEP_SUMMARY"
