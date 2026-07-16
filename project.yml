@@ -43,12 +43,13 @@ targets:
         excludes:
           - "**/.DS_Store"
     dependencies:
-      # AMSMB2 是动态 framework，必须 embed，否则 dyld 找不到秒退
+      # AMSMB2 是动态 framework，必须 embed，否则 dyld 找不到 @rpath 秒退
       - package: AMSMB2
         product: AMSMB2
         embed: true
-      # Citadel（以及 swift-nio / swift-crypto）是静态库，已在主二进制中，
-      # 不需要 embed
+      # Citadel + 依赖（swift-nio / swift-crypto）是静态库，已编译进主二进制
+      - package: Citadel
+        product: Citadel
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.n1backup.photobackup
