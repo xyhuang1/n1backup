@@ -316,6 +316,7 @@ struct ServerEditView: View {
 
         do {
             let client = try StorageClientFactory.make(server: server, credentials: credentials)
+            defer { Task { await client.close() } }
             try await client.testConnection()
             testOK = true
             testMessage = "连接成功 ✓  可以设为备份目标并开始上传"

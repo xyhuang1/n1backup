@@ -33,3 +33,6 @@ ExportOptions.plist
 *.log
 .HBuilderx/
 node_modules/
+
+# 本地临时
+.tmp/

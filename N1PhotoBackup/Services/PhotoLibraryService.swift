@@ -105,6 +105,28 @@ enum PhotoLibraryService {
         return sanitizeFileName(String(format: "IMG_%.0f.%@", stamp, ext))
     }
 
+    /// 远端文件名：在原文件名上附加 localIdentifier 短哈希，避免同秒连拍 / 同名覆盖
+    static func uniqueFileName(for asset: PHAsset) -> String {
+        let base = preferredFileName(for: asset)
+        let ns = base as NSString
+        let ext = ns.pathExtension
+        let stem = ns.deletingPathExtension
+        let tag = shortTag(from: asset.localIdentifier)
+        if ext.isEmpty {
+            return sanitizeFileName("\(stem)_\(tag)")
+        }
+        return sanitizeFileName("\(stem)_\(tag).\(ext)")
+    }
+
+    private static func shortTag(from localIdentifier: String) -> String {
+        // PHAsset.localIdentifier 形如 "A1B2…/L0/001"，取稳定短后缀即可
+        let compact = localIdentifier
+            .replacingOccurrences(of: "/", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        if compact.count <= 8 { return compact }
+        return String(compact.prefix(8))
+    }
+
     static func sanitizeFileName(_ name: String) -> String {
         let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
         return name.components(separatedBy: invalid).joined(separator: "_")

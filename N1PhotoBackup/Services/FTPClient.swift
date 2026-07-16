@@ -6,7 +6,7 @@ import Foundation
 /// - 适用于基础上传；复杂目录/被动模式细节因系统实现而异
 /// - FTPS：打开「使用 TLS」
 /// - iStoreOS 若用 vsftpd / proftpd，请开启被动模式并放行端口范围
-final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
+final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate, URLSessionDelegate {
     private let server: StorageServer
     private let credentials: ServerCredentials
 
@@ -14,16 +14,27 @@ final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
         let conf = URLSessionConfiguration.default
         conf.timeoutIntervalForRequest = 60
         conf.timeoutIntervalForResource = 60 * 60 * 6
+        conf.waitsForConnectivity = true
         return URLSession(configuration: conf, delegate: self, delegateQueue: nil)
     }()
 
     private var progressHandlers: [Int: (Double) -> Void] = [:]
     private let progressLock = NSLock()
+    private var ensuredDirs = Set<String>()
+    private let dirLock = NSLock()
 
     init(server: StorageServer, credentials: ServerCredentials) {
         self.server = server
         self.credentials = credentials
         super.init()
+    }
+
+    deinit {
+        session.invalidateAndCancel()
+    }
+
+    func close() async {
+        session.finishTasksAndInvalidate()
     }
 
     func testConnection() async throws {
@@ -41,8 +52,6 @@ final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
         } catch let e as StorageError {
             throw e
         } catch {
-            // 部分 FTP 对 LIST 返回非 HTTP 风格，只要能握手即可
-            // 再尝试上传探测目录
             throw StorageError.connectionFailed(error.localizedDescription)
         }
     }
@@ -66,18 +75,32 @@ final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
 
     func ensureDirectories(relativeDir: String) async throws {
         // URLSession FTP 对 MKD 支持不稳定；上传时由服务端/用户预先建好基础目录更稳妥。
-        // 这里尽量按段 MKD。
         let full = server.joinedRemotePath(relativeDir)
+        dirLock.lock()
+        let already = ensuredDirs.contains(full)
+        dirLock.unlock()
+        if already { return }
+
         let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
         var built = ""
         for part in parts {
             built += "/" + part
+            dirLock.lock()
+            let known = ensuredDirs.contains(built)
+            dirLock.unlock()
+            if known { continue }
             guard let url = makeURL(path: built) else { continue }
             var request = URLRequest(url: url)
             request.httpMethod = "MKD"
             applyAuth(to: &request)
             _ = try? await session.data(for: request)
+            dirLock.lock()
+            ensuredDirs.insert(built)
+            dirLock.unlock()
         }
+        dirLock.lock()
+        ensuredDirs.insert(full)
+        dirLock.unlock()
     }
 
     func uploadFile(
@@ -107,7 +130,6 @@ final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
                     return
                 }
                 if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                    // FTP 经 URLSession 时状态码可能非标准
                     if http.statusCode == 401 {
                         cont.resume(throwing: StorageError.authFailed)
                         return
@@ -135,7 +157,14 @@ final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
             components.password = credentials.password
         }
         let normalized = path.hasPrefix("/") ? path : "/" + path
-        components.path = normalized
+        // 分段编码，避免空格等字符破坏路径
+        components.percentEncodedPath = normalized
+            .split(separator: "/", omittingEmptySubsequences: false)
+            .map { seg -> String in
+                if seg.isEmpty { return "" }
+                return seg.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String(seg)
+            }
+            .joined(separator: "/")
         return components.url
     }
 
@@ -161,6 +190,12 @@ final class FTPStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
         let handler = progressHandlers[task.taskIdentifier]
         progressLock.unlock()
         handler?(min(max(p, 0), 1))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        progressLock.lock()
+        progressHandlers[task.taskIdentifier] = nil
+        progressLock.unlock()
     }
 
     func urlSession(

@@ -239,11 +239,12 @@ struct HomeView: View {
 
     private func runBackupRecent(days: Int) async {
         isLoading = true
+        let before = uploadManager.totalCount
         defer { isLoading = false }
         do {
             try await uploadManager.enqueueRecent(days: days)
-            if uploadManager.totalCount == 0 {
-                present(message: "最近 \(days) 天没有可备份的照片或视频")
+            if uploadManager.totalCount == before {
+                present(message: "最近 \(days) 天没有新的可备份照片/视频（或均已在队列中）")
             }
         } catch {
             present(error)
@@ -252,11 +253,12 @@ struct HomeView: View {
 
     private func runBackupAll() async {
         isLoading = true
+        let before = uploadManager.totalCount
         defer { isLoading = false }
         do {
             try await uploadManager.enqueueAll()
-            if uploadManager.totalCount == 0 {
-                present(message: "相册为空")
+            if uploadManager.totalCount == before {
+                present(message: "没有新的可备份项目（相册为空或均已在队列中）")
             }
         } catch {
             present(error)

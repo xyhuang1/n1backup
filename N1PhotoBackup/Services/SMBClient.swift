@@ -1,61 +1,83 @@
 import Foundation
 import AMSMB2
 
-/// SMB / Samba（工程已链接 AMSMB2，直接可用）
-final class SMBStorageClient: StorageClient {
+/// SMB / Samba（工程已链接 AMSMB2）
+/// 连接在客户端生命周期内复用，操作经 SerialExecutor 串行，避免并发写冲突。
+final class SMBStorageClient: StorageClient, @unchecked Sendable {
     private let server: StorageServer
     private let credentials: ServerCredentials
+    private let gate = SerialExecutor()
+
+    private var manager: SMB2Manager?
+    private var shareConnected = false
+    private var ensuredDirs = Set<String>()
 
     init(server: StorageServer, credentials: ServerCredentials) {
         self.server = server
         self.credentials = credentials
     }
 
+    func close() async {
+        await gate.run { [self] in
+            if shareConnected {
+                manager?.disconnectShare()
+                shareConnected = false
+            }
+            manager = nil
+            ensuredDirs.removeAll()
+        }
+    }
+
     func testConnection() async throws {
-        let manager = try makeManager()
-        do {
-            try await manager.connectShare(name: server.normalizedShareName)
-            defer { manager.disconnectShare() }
+        try await gate.run { [self] in
+            let mgr = try await ensureConnected()
             let root = server.normalizedBasePath
-            _ = try await manager.contentsOfDirectory(atPath: root.isEmpty ? "/" : root)
-        } catch {
-            throw StorageError.connectionFailed(friendly(error))
+            do {
+                _ = try await mgr.contentsOfDirectory(atPath: root.isEmpty ? "/" : root)
+            } catch {
+                throw StorageError.connectionFailed(friendly(error))
+            }
         }
     }
 
     func remoteExists(relativePath: String) async throws -> Bool {
-        let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
-        let manager = try makeManager()
-        do {
-            try await manager.connectShare(name: server.normalizedShareName)
-            defer { manager.disconnectShare() }
-            _ = try await manager.attributesOfItem(atPath: path)
-            return true
-        } catch {
-            return false
+        try await gate.run { [self] in
+            let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
+            let mgr = try await ensureConnected()
+            do {
+                _ = try await mgr.attributesOfItem(atPath: path)
+                return true
+            } catch {
+                return false
+            }
         }
     }
 
     func ensureDirectories(relativeDir: String) async throws {
-        let full = normalizeSMBPath(server.joinedRemotePath(relativeDir))
-        let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-        guard !parts.isEmpty else { return }
+        try await gate.run { [self] in
+            let full = normalizeSMBPath(server.joinedRemotePath(relativeDir))
+            if ensuredDirs.contains(full) { return }
 
-        let manager = try makeManager()
-        do {
-            try await manager.connectShare(name: server.normalizedShareName)
-            defer { manager.disconnectShare() }
-            var built = ""
-            for part in parts {
-                built = built.isEmpty ? part : "\(built)/\(part)"
-                do {
-                    try await manager.createDirectory(atPath: built)
-                } catch {
-                    // 已存在
+            let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+            guard !parts.isEmpty else { return }
+
+            let mgr = try await ensureConnected()
+            do {
+                var built = ""
+                for part in parts {
+                    built = built.isEmpty ? part : "\(built)/\(part)"
+                    if ensuredDirs.contains(built) { continue }
+                    do {
+                        try await mgr.createDirectory(atPath: built)
+                    } catch {
+                        // 已存在
+                    }
+                    ensuredDirs.insert(built)
                 }
+                ensuredDirs.insert(full)
+            } catch {
+                throw StorageError.remote(friendly(error))
             }
-        } catch {
-            throw StorageError.remote(friendly(error))
         }
     }
 
@@ -70,30 +92,48 @@ final class SMBStorageClient: StorageClient {
             try await ensureDirectories(relativeDir: parent)
         }
 
-        let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
-        let data = try Data(contentsOf: localURL)
+        // 大文件整读进内存是瓶颈，但 AMSMB2 的 write(data:) API 如此；后续可换流式 write
+        let data = try Data(contentsOf: localURL, options: [.mappedIfSafe])
         let total = max(Double(data.count), 1)
+        let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
 
-        let manager = try makeManager()
-        do {
-            try await manager.connectShare(name: server.normalizedShareName)
-            defer { manager.disconnectShare() }
-
-            try await manager.write(
-                data: data,
-                progress: { sent in
-                    progress?(min(Double(sent) / total, 1))
-                    return true
-                },
-                toPath: path
-            )
-            progress?(1)
-        } catch {
-            throw StorageError.remote(friendly(error))
+        try await gate.run { [self] in
+            let mgr = try await ensureConnected()
+            do {
+                try await mgr.write(
+                    data: data,
+                    progress: { sent in
+                        progress?(min(Double(sent) / total, 1))
+                        return true
+                    },
+                    toPath: path
+                )
+                progress?(1)
+            } catch {
+                // 连接可能已断，下次 ensureConnected 重建
+                shareConnected = false
+                manager = nil
+                throw StorageError.remote(friendly(error))
+            }
         }
     }
 
-    // MARK: -
+    // MARK: - Connection
+
+    private func ensureConnected() async throws -> SMB2Manager {
+        if let manager, shareConnected {
+            return manager
+        }
+        let mgr = try makeManager()
+        do {
+            try await mgr.connectShare(name: server.normalizedShareName)
+        } catch {
+            throw StorageError.connectionFailed(friendly(error))
+        }
+        manager = mgr
+        shareConnected = true
+        return mgr
+    }
 
     private func makeManager() throws -> SMB2Manager {
         let host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)

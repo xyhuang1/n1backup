@@ -6,7 +6,8 @@ enum KeychainStore {
 
     // MARK: - 通用字符串
 
-    static func save(account: String, value: String) {
+    @discardableResult
+    static func save(account: String, value: String) -> Bool {
         let data = Data(value.utf8)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -18,7 +19,8 @@ enum KeychainStore {
         var add = query
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(add as CFDictionary, nil)
+        let status = SecItemAdd(add as CFDictionary, nil)
+        return status == errSecSuccess
     }
 
     static func read(account: String) -> String? {

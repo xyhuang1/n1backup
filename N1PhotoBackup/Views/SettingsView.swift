@@ -59,7 +59,7 @@ struct SettingsView: View {
                 Section("关于") {
                     LabeledContent("应用", value: "N1 相册备份")
                     LabeledContent("协议", value: "WebDAV · SMB · SFTP · FTP")
-                    LabeledContent("版本", value: "1.1")
+                    LabeledContent("版本", value: "1.2.0")
                 }
             }
             .navigationTitle("设置")

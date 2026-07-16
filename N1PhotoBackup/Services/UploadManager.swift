@@ -14,7 +14,11 @@ final class UploadManager: ObservableObject {
     @Published private(set) var totalCount: Int = 0
 
     private var task: Task<Void, Never>?
+    /// WebDAV 可并行；SMB/SFTP 在客户端内部串行，这里仍允许 2 路导出+上传流水线
     private let maxConcurrent = 2
+    /// 进度 UI 节流：避免每个 TCP 分片都触发 SwiftUI 刷新
+    private var lastProgressAt: [String: CFAbsoluteTime] = [:]
+    private let progressMinInterval: CFAbsoluteTime = 0.2
 
     var progressText: String {
         guard totalCount > 0 else { return "空闲" }
@@ -29,8 +33,17 @@ final class UploadManager: ObservableObject {
     // MARK: - Enqueue
 
     func enqueue(assets: [PHAsset], server: StorageServer) {
-        let newItems: [UploadItem] = assets.map { asset in
-            let name = PhotoLibraryService.preferredFileName(for: asset)
+        // 队列中已有（未失败）的同资源不再重复入队
+        let activeIds = Set(
+            items.compactMap { item -> String? in
+                if case .failed = item.status { return nil }
+                return item.assetLocalIdentifier
+            }
+        )
+
+        let newItems: [UploadItem] = assets.compactMap { asset in
+            guard !activeIds.contains(asset.localIdentifier) else { return nil }
+            let name = PhotoLibraryService.uniqueFileName(for: asset)
             let remote = DatePath.remoteRelativePath(
                 fileName: name,
                 date: asset.creationDate,
@@ -47,8 +60,8 @@ final class UploadManager: ObservableObject {
                 remoteRelativePath: remote
             )
         }
+        guard !newItems.isEmpty else { return }
         items.append(contentsOf: newItems)
-        totalCount = items.count
         recomputeFinished()
         startIfNeeded()
     }
@@ -80,7 +93,7 @@ final class UploadManager: ObservableObject {
 
     func clearFinished() {
         items.removeAll { $0.status.isFinished }
-        totalCount = items.count
+        lastProgressAt = lastProgressAt.filter { id, _ in items.contains(where: { $0.id == id }) }
         recomputeFinished()
     }
 
@@ -89,6 +102,7 @@ final class UploadManager: ObservableObject {
         task = nil
         isRunning = false
         items.removeAll()
+        lastProgressAt.removeAll()
         totalCount = 0
         finishedCount = 0
     }
@@ -120,54 +134,65 @@ final class UploadManager: ObservableObject {
             task = nil
         }
 
-        while !Task.isCancelled {
-            let pending = items.filter { $0.status == .pending }
-            if pending.isEmpty { break }
-
-            let batch = Array(pending.prefix(maxConcurrent))
-            for item in batch {
-                update(itemId: item.id, status: .exporting)
-            }
-
-            await withTaskGroup(of: Void.self) { group in
-                for item in batch {
-                    let snapshot = item
-                    group.addTask { [weak self] in
-                        await self?.processOffMain(snapshot)
-                    }
-                }
-            }
-            recomputeFinished()
-        }
-    }
-
-    private nonisolated func processOffMain(_ item: UploadItem) async {
-        let itemId = item.id
-
-        let context: (StorageServer, ServerCredentials, Bool)? = await MainActor.run {
-            guard let server = ServerStore.shared.selectedServer else { return nil }
-            let creds = ServerStore.shared.credentials(for: server)
-            return (server, creds, UploadManager.shared.skipExisting)
-        }
-
-        guard let (server, credentials, skip) = context else {
-            await MainActor.run {
-                UploadManager.shared.markFailed(itemId: itemId, message: "未选择服务器")
-            }
+        guard let server = ServerStore.shared.selectedServer else {
+            lastError = "未选择服务器"
             return
         }
+        let credentials = ServerStore.shared.credentials(for: server)
 
         let client: StorageClient
         do {
             client = try StorageClientFactory.make(server: server, credentials: credentials)
         } catch {
             let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            await MainActor.run { UploadManager.shared.markFailed(itemId: itemId, message: msg) }
+            lastError = msg
+            for i in items.indices where items[i].status == .pending {
+                items[i].status = .failed(msg)
+            }
+            recomputeFinished()
             return
         }
 
+        // 整轮备份复用同一连接；结束时关闭
+        await withTaskCancellationHandler {
+            let skip = skipExisting
+            while !Task.isCancelled {
+                let pending = items.filter { $0.status == .pending }
+                if pending.isEmpty { break }
+
+                let batch = Array(pending.prefix(maxConcurrent))
+                await withTaskGroup(of: Void.self) { group in
+                    for item in batch {
+                        let snapshot = item
+                        group.addTask { [weak self] in
+                            await self?.process(
+                                snapshot,
+                                client: client,
+                                server: server,
+                                skipExisting: skip
+                            )
+                        }
+                    }
+                }
+                recomputeFinished()
+            }
+        } onCancel: {
+            // 取消时尽快释放连接（close 幂等）
+            Task { await client.close() }
+        }
+        await client.close()
+    }
+
+    private nonisolated func process(
+        _ item: UploadItem,
+        client: StorageClient,
+        server: StorageServer,
+        skipExisting: Bool
+    ) async {
+        let itemId = item.id
+
         do {
-            if skip {
+            if skipExisting {
                 await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .checking) }
                 if try await client.remoteExists(relativePath: item.remoteRelativePath) {
                     await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
@@ -177,9 +202,7 @@ final class UploadManager: ObservableObject {
 
             await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .exporting) }
 
-            let asset: PHAsset? = await MainActor.run {
-                PhotoLibraryService.fetchAssets(localIdentifiers: [item.assetLocalIdentifier]).first
-            }
+            let asset = PhotoLibraryService.fetchAssets(localIdentifiers: [item.assetLocalIdentifier]).first
             guard let asset else {
                 await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .failed("资源已删除")) }
                 return
@@ -188,14 +211,17 @@ final class UploadManager: ObservableObject {
             let exported = try await PhotoLibraryService.exportOriginal(asset: asset)
             defer { try? FileManager.default.removeItem(at: exported.fileURL) }
 
+            // 导出后的真实文件名可能与预估不同；保持入队时的 unique 名，仅在远程路径日期上对齐
             let remotePath = DatePath.remoteRelativePath(
-                fileName: exported.fileName,
+                fileName: item.fileName,
                 date: exported.creationDate ?? item.creationDate,
                 layout: server.folderLayout
             )
-            await MainActor.run { UploadManager.shared.updatePath(itemId: itemId, path: remotePath) }
+            if remotePath != item.remoteRelativePath {
+                await MainActor.run { UploadManager.shared.updatePath(itemId: itemId, path: remotePath) }
+            }
 
-            if skip, try await client.remoteExists(relativePath: remotePath) {
+            if skipExisting, try await client.remoteExists(relativePath: remotePath) {
                 await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
                 return
             }
@@ -208,7 +234,7 @@ final class UploadManager: ObservableObject {
                 contentType: exported.contentType
             ) { p in
                 Task { @MainActor in
-                    UploadManager.shared.update(itemId: itemId, status: .uploading(progress: p))
+                    UploadManager.shared.updateProgress(itemId: itemId, progress: p)
                 }
             }
 
@@ -224,7 +250,31 @@ final class UploadManager: ObservableObject {
     fileprivate func update(itemId: String, status: UploadStatus) {
         guard let i = items.firstIndex(where: { $0.id == itemId }) else { return }
         items[i].status = status
+        if status.isFinished {
+            lastProgressAt.removeValue(forKey: itemId)
+        }
         recomputeFinished()
+    }
+
+    fileprivate func updateProgress(itemId: String, progress: Double) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let last = lastProgressAt[itemId],
+           now - last < progressMinInterval,
+           progress < 0.99 {
+            return
+        }
+        lastProgressAt[itemId] = now
+        guard let i = items.firstIndex(where: { $0.id == itemId }) else { return }
+        // 仅在仍处于上传态时更新，避免覆盖终态
+        if case .uploading = items[i].status {
+            items[i].status = .uploading(progress: min(max(progress, 0), 1))
+        } else if case .pending = items[i].status {
+            items[i].status = .uploading(progress: min(max(progress, 0), 1))
+        } else if case .exporting = items[i].status {
+            items[i].status = .uploading(progress: min(max(progress, 0), 1))
+        } else if case .checking = items[i].status {
+            items[i].status = .uploading(progress: min(max(progress, 0), 1))
+        }
     }
 
     fileprivate func updatePath(itemId: String, path: String) {

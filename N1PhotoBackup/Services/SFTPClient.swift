@@ -2,31 +2,49 @@ import Foundation
 import Citadel
 import NIOCore
 
-/// SFTP 客户端（Citadel，工程已通过 SPM 链接，开箱即用）
-final class SFTPStorageClient: StorageClient {
+/// SFTP 客户端（Citadel）
+/// SSH/SFTP 会话在客户端生命周期内复用，操作经 SerialExecutor 串行。
+final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     private let server: StorageServer
     private let credentials: ServerCredentials
+    private let gate = SerialExecutor()
+
+    private var ssh: SSHClient?
+    private var sftp: SFTPClient?
+    private var ensuredDirs = Set<String>()
 
     init(server: StorageServer, credentials: ServerCredentials) {
         self.server = server
         self.credentials = credentials
     }
 
+    func close() async {
+        await gate.run { [self] in
+            await tearDown()
+        }
+    }
+
     func testConnection() async throws {
-        try await withSFTP { sftp in
-            let path = self.server.normalizedBasePath
-            // 列一下基础目录；不存在时尝试列 /
+        try await gate.run { [self] in
+            let sftp = try await ensureSFTP()
+            let path = server.normalizedBasePath
             do {
                 _ = try await sftp.listDirectory(atPath: path.isEmpty ? "/" : path)
             } catch {
-                _ = try await sftp.listDirectory(atPath: "/")
+                // 基础目录可能尚未创建，至少确认能列 /
+                do {
+                    _ = try await sftp.listDirectory(atPath: "/")
+                } catch {
+                    throw StorageError.connectionFailed(friendly(error))
+                }
             }
         }
     }
 
     func remoteExists(relativePath: String) async throws -> Bool {
-        let path = server.joinedRemotePath(relativePath)
-        return try await withSFTP { sftp in
+        try await gate.run { [self] in
+            let path = server.joinedRemotePath(relativePath)
+            let sftp = try await ensureSFTP()
             do {
                 _ = try await sftp.getAttributes(at: path)
                 return true
@@ -37,20 +55,26 @@ final class SFTPStorageClient: StorageClient {
     }
 
     func ensureDirectories(relativeDir: String) async throws {
-        let full = server.joinedRemotePath(relativeDir)
-        let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-        guard !parts.isEmpty else { return }
+        try await gate.run { [self] in
+            let full = server.joinedRemotePath(relativeDir)
+            if ensuredDirs.contains(full) { return }
 
-        try await withSFTP { sftp in
+            let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+            guard !parts.isEmpty else { return }
+
+            let sftp = try await ensureSFTP()
             var built = ""
             for part in parts {
                 built += "/" + part
+                if ensuredDirs.contains(built) { continue }
                 do {
                     try await sftp.createDirectory(atPath: built)
                 } catch {
                     // 已存在
                 }
+                ensuredDirs.insert(built)
             }
+            ensuredDirs.insert(full)
         }
     }
 
@@ -66,27 +90,37 @@ final class SFTPStorageClient: StorageClient {
         }
 
         let path = server.joinedRemotePath(relativePath)
-        let fileData = try Data(contentsOf: localURL)
+        // mappedIfSafe 减少大文件内存拷贝
+        let fileData = try Data(contentsOf: localURL, options: [.mappedIfSafe])
         progress?(0.05)
 
-        try await withSFTP { sftp in
-            try await sftp.withFile(
-                filePath: path,
-                flags: [.write, .create, .truncate]
-            ) { file in
-                var buffer = ByteBufferAllocator().buffer(capacity: fileData.count)
-                buffer.writeBytes(fileData)
-                try await file.write(buffer)
+        try await gate.run { [self] in
+            do {
+                let sftp = try await ensureSFTP()
+                try await sftp.withFile(
+                    filePath: path,
+                    flags: [.write, .create, .truncate]
+                ) { file in
+                    var buffer = ByteBufferAllocator().buffer(capacity: fileData.count)
+                    buffer.writeBytes(fileData)
+                    try await file.write(buffer)
+                }
+                progress?(1)
+            } catch let e as StorageError {
+                await tearDown()
+                throw e
+            } catch {
+                await tearDown()
+                throw StorageError.remote(friendly(error))
             }
         }
-        progress?(1)
     }
 
     // MARK: - Connection
 
-    private func withSFTP<T: Sendable>(
-        _ body: @Sendable (SFTPClient) async throws -> T
-    ) async throws -> T {
+    private func ensureSFTP() async throws -> SFTPClient {
+        if let sftp { return sftp }
+
         let host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else {
             throw StorageError.invalidConfiguration("主机不能为空")
@@ -96,7 +130,6 @@ final class SFTPStorageClient: StorageClient {
             throw StorageError.invalidConfiguration("SFTP 用户名不能为空")
         }
 
-        // 私钥登录：Citadel 版本差异大，优先密码；有私钥且密码为空时给出明确提示
         if server.usePrivateKey, credentials.password.isEmpty, !credentials.privateKey.isEmpty {
             throw StorageError.invalidConfiguration(
                 "当前版本优先支持密码登录。请关闭「使用 SSH 私钥」，填写 SSH 密码后重试（或在 N1 上为该用户设置密码）。"
@@ -112,9 +145,9 @@ final class SFTPStorageClient: StorageClient {
             password: credentials.password
         )
 
-        let ssh: SSHClient
+        let client: SSHClient
         do {
-            ssh = try await SSHClient.connect(
+            client = try await SSHClient.connect(
                 host: host,
                 port: port,
                 authenticationMethod: auth,
@@ -126,22 +159,25 @@ final class SFTPStorageClient: StorageClient {
         }
 
         do {
-            let sftp = try await ssh.openSFTP()
-            do {
-                let result = try await body(sftp)
-                try? await ssh.close()
-                return result
-            } catch {
-                try? await ssh.close()
-                throw StorageError.remote(friendly(error))
-            }
-        } catch let e as StorageError {
-            try? await ssh.close()
-            throw e
+            let session = try await client.openSFTP()
+            ssh = client
+            sftp = session
+            return session
         } catch {
-            try? await ssh.close()
+            try? await client.close()
+            ssh = nil
+            sftp = nil
             throw StorageError.connectionFailed(friendly(error))
         }
+    }
+
+    private func tearDown() async {
+        sftp = nil
+        if let ssh {
+            try? await ssh.close()
+        }
+        self.ssh = nil
+        ensuredDirs.removeAll()
     }
 
     private func friendly(_ error: Error) -> String {

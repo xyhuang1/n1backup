@@ -1,7 +1,7 @@
 import Foundation
 
 /// WebDAV 实现（URLSession，无第三方依赖）
-final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate {
+final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate, URLSessionDelegate {
     private let server: StorageServer
     private let credentials: ServerCredentials
 
@@ -10,16 +10,28 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         conf.timeoutIntervalForRequest = 60
         conf.timeoutIntervalForResource = 60 * 60 * 6
         conf.waitsForConnectivity = true
+        conf.httpMaximumConnectionsPerHost = 4
         return URLSession(configuration: conf, delegate: self, delegateQueue: nil)
     }()
 
     private var progressHandlers: [Int: (Double) -> Void] = [:]
     private let progressLock = NSLock()
+    /// 本轮上传已创建过的远程目录，避免重复 MKCOL
+    private var ensuredDirs = Set<String>()
+    private let dirLock = NSLock()
 
     init(server: StorageServer, credentials: ServerCredentials) {
         self.server = server
         self.credentials = credentials
         super.init()
+    }
+
+    deinit {
+        session.invalidateAndCancel()
+    }
+
+    func close() async {
+        session.finishTasksAndInvalidate()
     }
 
     func testConnection() async throws {
@@ -30,7 +42,7 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         let path = server.joinedRemotePath(relativePath)
         guard let url = makeURL(path: path) else { throw StorageError.invalidConfiguration("URL 无效") }
 
-        var head = authorizedRequest(url: url, method: "HEAD")
+        let head = authorizedRequest(url: url, method: "HEAD")
         do {
             let (_, response) = try await data(for: head, allowStatuses: [200, 204, 404, 405])
             if let http = response as? HTTPURLResponse {
@@ -38,7 +50,7 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
                 if http.statusCode == 404 { return false }
             }
         } catch {
-            // fallthrough
+            // fallthrough to PROPFIND
         }
 
         do {
@@ -52,12 +64,27 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
 
     func ensureDirectories(relativeDir: String) async throws {
         let full = server.joinedRemotePath(relativeDir)
+        dirLock.lock()
+        let already = ensuredDirs.contains(full)
+        dirLock.unlock()
+        if already { return }
+
         let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
         var built = ""
         for part in parts {
             built += "/" + part
+            dirLock.lock()
+            let known = ensuredDirs.contains(built)
+            dirLock.unlock()
+            if known { continue }
             try await mkcol(absolutePath: built)
+            dirLock.lock()
+            ensuredDirs.insert(built)
+            dirLock.unlock()
         }
+        dirLock.lock()
+        ensuredDirs.insert(full)
+        dirLock.unlock()
     }
 
     func uploadFile(
@@ -92,6 +119,7 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         let request = authorizedRequest(url: url, method: "MKCOL")
         let (_, response) = try await data(for: request, allowStatuses: [200, 201, 301, 302, 405, 409])
         guard let http = response as? HTTPURLResponse else { return }
+        // 201 新建；405 已存在；200/3xx 部分网关
         if [201, 405, 200, 301, 302].contains(http.statusCode) { return }
         if http.statusCode == 409 { throw StorageError.remote("创建目录失败（父目录不存在）: \(absolutePath)") }
         throw StorageError.httpStatus(http.statusCode, nil)
@@ -127,6 +155,7 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         components.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
         components.port = server.port
         let normalized = path.hasPrefix("/") ? path : "/" + path
+        // 对路径段做编码，保留 /
         components.percentEncodedPath = normalized
             .split(separator: "/", omittingEmptySubsequences: false)
             .map { seg -> String in
@@ -191,6 +220,8 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
             task.resume()
         }
     }
+
+    // MARK: - URLSession delegates
 
     func urlSession(
         _ session: URLSession,

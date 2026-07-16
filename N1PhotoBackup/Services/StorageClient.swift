@@ -35,6 +35,19 @@ protocol StorageClient: AnyObject {
         contentType: String?,
         progress: ((Double) -> Void)?
     ) async throws
+    /// 释放长连接（默认空实现）
+    func close() async
+}
+
+extension StorageClient {
+    func close() async {}
+}
+
+/// 串行化异步操作，避免 SMB/SFTP 连接并发写冲突
+actor SerialExecutor {
+    func run<T: Sendable>(_ work: @Sendable () async throws -> T) async rethrows -> T {
+        try await work()
+    }
 }
 
 enum StorageClientFactory {
