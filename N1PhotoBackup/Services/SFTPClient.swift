@@ -1,9 +1,11 @@
 import Foundation
 import Citadel
+import Crypto
 import NIOCore
 
-/// SFTP 客户端（Citadel）
+/// SFTP 客户端（Citadel 0.12.x）
 /// SSH/SFTP 会话在客户端生命周期内复用，操作经 SerialExecutor 串行。
+/// 支持：密码登录、OpenSSH 格式私钥（ed25519 / RSA）。
 final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     private let server: StorageServer
     private let credentials: ServerCredentials
@@ -27,9 +29,9 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     func testConnection() async throws {
         try await gate.run { [self] in
             let sftp = try await ensureSFTP()
-            let path = server.normalizedBasePath
+            let path = normalized(server.normalizedBasePath)
             do {
-                _ = try await sftp.listDirectory(atPath: path.isEmpty ? "/" : path)
+                _ = try await sftp.listDirectory(atPath: path)
             } catch {
                 // 基础目录可能尚未创建，至少确认能列 /
                 do {
@@ -43,7 +45,7 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
 
     func remoteExists(relativePath: String) async throws -> Bool {
         try await gate.run { [self] in
-            let path = server.joinedRemotePath(relativePath)
+            let path = normalized(server.joinedRemotePath(relativePath))
             let sftp = try await ensureSFTP()
             do {
                 _ = try await sftp.getAttributes(at: path)
@@ -56,7 +58,7 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
 
     func ensureDirectories(relativeDir: String) async throws {
         try await gate.run { [self] in
-            let full = server.joinedRemotePath(relativeDir)
+            let full = normalized(server.joinedRemotePath(relativeDir))
             if ensuredDirs.contains(full) { return }
 
             let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
@@ -89,14 +91,14 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
             try await ensureDirectories(relativeDir: parent)
         }
 
-        let path = server.joinedRemotePath(relativePath)
-        // mappedIfSafe 减少大文件内存拷贝
+        let path = normalized(server.joinedRemotePath(relativePath))
         let fileData = try Data(contentsOf: localURL, options: [.mappedIfSafe])
         progress?(0.05)
 
         try await gate.run { [self] in
             do {
                 let sftp = try await ensureSFTP()
+                // write + create + truncate：覆盖已有文件
                 try await sftp.withFile(
                     filePath: path,
                     flags: [.write, .create, .truncate]
@@ -130,21 +132,16 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
             throw StorageError.invalidConfiguration("SFTP 用户名不能为空")
         }
 
-        if server.usePrivateKey, credentials.password.isEmpty, !credentials.privateKey.isEmpty {
-            throw StorageError.invalidConfiguration(
-                "当前版本优先支持密码登录。请关闭「使用 SSH 私钥」，填写 SSH 密码后重试（或在 N1 上为该用户设置密码）。"
-            )
-        }
-        if credentials.password.isEmpty {
-            throw StorageError.invalidConfiguration("请填写 SSH/SFTP 密码")
+        let auth: SSHAuthenticationMethod
+        do {
+            auth = try makeAuth(username: user)
+        } catch let e as StorageError {
+            throw e
+        } catch {
+            throw StorageError.invalidConfiguration("私钥解析失败：\(error.localizedDescription)")
         }
 
         let port = server.port > 0 ? server.port : 22
-        let auth = SSHAuthenticationMethod.passwordBased(
-            username: user,
-            password: credentials.password
-        )
-
         let client: SSHClient
         do {
             client = try await SSHClient.connect(
@@ -171,6 +168,68 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
         }
     }
 
+    /// 密码 或 OpenSSH 私钥（ed25519 / RSA）
+    private func makeAuth(username user: String) throws -> SSHAuthenticationMethod {
+        let keyText = credentials.privateKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let wantKey = server.usePrivateKey || !keyText.isEmpty
+
+        if wantKey {
+            guard !keyText.isEmpty else {
+                throw StorageError.invalidConfiguration("已开启私钥登录，请粘贴 OpenSSH 私钥正文")
+            }
+            if keyText.contains("BEGIN RSA PRIVATE KEY")
+                || keyText.contains("BEGIN EC PRIVATE KEY")
+                || (keyText.contains("BEGIN PRIVATE KEY") && !keyText.contains("OPENSSH")) {
+                throw StorageError.invalidConfiguration(
+                    "请使用 OpenSSH 格式私钥（ssh-keygen 默认输出，开头为 -----BEGIN OPENSSH PRIVATE KEY-----）。可用 `ssh-keygen -p -m rfc4718` 或重新生成。"
+                )
+            }
+
+            let decryptionKey: Data? = credentials.passphrase.isEmpty
+                ? nil
+                : Data(credentials.passphrase.utf8)
+
+            // 优先用官方检测；失败则按常见类型依次尝试
+            if keyText.contains("BEGIN OPENSSH PRIVATE KEY"),
+               let type = try? SSHKeyDetection.detectPrivateKeyType(from: keyText) {
+                if type == .ed25519 {
+                    let pk = try Curve25519.Signing.PrivateKey(
+                        sshEd25519: keyText,
+                        decryptionKey: decryptionKey
+                    )
+                    return .ed25519(username: user, privateKey: pk)
+                }
+                if type == .rsa {
+                    let pk = try Insecure.RSA.PrivateKey(
+                        sshRsa: keyText,
+                        decryptionKey: decryptionKey
+                    )
+                    return .rsa(username: user, privateKey: pk)
+                }
+                throw StorageError.invalidConfiguration(
+                    "暂不支持 \(type.description) 私钥，请改用 ed25519 / RSA，或改用密码登录"
+                )
+            }
+
+            // 检测失败时回退尝试
+            if let pk = try? Curve25519.Signing.PrivateKey(sshEd25519: keyText, decryptionKey: decryptionKey) {
+                return .ed25519(username: user, privateKey: pk)
+            }
+            if let pk = try? Insecure.RSA.PrivateKey(sshRsa: keyText, decryptionKey: decryptionKey) {
+                return .rsa(username: user, privateKey: pk)
+            }
+
+            throw StorageError.invalidConfiguration(
+                "无法解析私钥。请确认是 OpenSSH 格式（ed25519/RSA），口令正确；或改用密码登录。"
+            )
+        }
+
+        if credentials.password.isEmpty {
+            throw StorageError.invalidConfiguration("请填写 SSH/SFTP 密码，或开启「使用 SSH 私钥」并粘贴私钥")
+        }
+        return .passwordBased(username: user, password: credentials.password)
+    }
+
     private func tearDown() async {
         sftp = nil
         if let ssh {
@@ -180,12 +239,21 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
         ensuredDirs.removeAll()
     }
 
+    private func normalized(_ path: String) -> String {
+        var p = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if p.isEmpty { return "/" }
+        if !p.hasPrefix("/") { p = "/" + p }
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return p
+    }
+
     private func friendly(_ error: Error) -> String {
         let msg = error.localizedDescription
         if msg.localizedCaseInsensitiveContains("auth")
             || msg.localizedCaseInsensitiveContains("permission")
-            || msg.localizedCaseInsensitiveContains("denied") {
-            return "认证失败或无权限：请检查用户名/密码，以及目录写权限"
+            || msg.localizedCaseInsensitiveContains("denied")
+            || msg.localizedCaseInsensitiveContains("authentication") {
+            return "认证失败或无权限：请检查用户名/密码/私钥，以及目录写权限"
         }
         if msg.localizedCaseInsensitiveContains("timed out")
             || msg.localizedCaseInsensitiveContains("timeout") {

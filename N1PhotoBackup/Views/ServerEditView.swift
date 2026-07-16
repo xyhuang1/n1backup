@@ -217,9 +217,14 @@ struct ServerEditView: View {
 
     private var optionsSection: some View {
         Section("状态") {
-            Label("WebDAV / SMB / SFTP / FTP 均已内置，填好参数即可测试连接", systemImage: "checkmark.seal.fill")
+            Label("WebDAV / SMB / SFTP / FTP 均已内置（含依赖库），填好参数即可测试连接", systemImage: "checkmark.seal.fill")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+            if server.protocolKind == .sftp {
+                Text("SFTP 支持密码，或 OpenSSH 私钥（ed25519 / RSA，-----BEGIN OPENSSH PRIVATE KEY-----）。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

@@ -1,5 +1,8 @@
-# XcodeGen 工程 —— 已内置 SMB / SFTP 依赖，无需再手动加包
+# XcodeGen — SMB(AMSMB2) / SFTP(Citadel) 已内置
 # 生成: xcodegen generate
+#
+# AMSMB2 是动态 framework，必须 embed=true，否则未签名 IPA 重签后 dyld 秒退。
+# Citadel + NIO/Crypto 是静态库，链进主二进制，不要 embed。
 
 name: N1PhotoBackup
 
@@ -10,25 +13,26 @@ options:
   createIntermediateGroups: true
   groupSortPosition: top
 
-# 正式接入第三方库（编译时自动下载）
 packages:
   AMSMB2:
     url: https://github.com/amosavian/AMSMB2
-    from: 4.0.0
+    exactVersion: 4.0.3
   Citadel:
     url: https://github.com/orlandos-nl/Citadel
-    from: 0.9.0
+    exactVersion: 0.12.1
 
 settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    CURRENT_PROJECT_VERSION: "1"
-    MARKETING_VERSION: "1.2.0"
+    CURRENT_PROJECT_VERSION: "4"
+    MARKETING_VERSION: "1.3.0"
     CODE_SIGN_STYLE: Manual
     ENABLE_USER_SCRIPT_SANDBOXING: false
     CLANG_ENABLE_MODULES: YES
+    # 降低第三方包并发严格检查导致的硬失败
+    SWIFT_STRICT_CONCURRENCY: minimal
 
 configs:
   Debug: debug
@@ -43,11 +47,9 @@ targets:
         excludes:
           - "**/.DS_Store"
     dependencies:
-      # AMSMB2 是动态 framework，必须 embed，否则 dyld 找不到 @rpath 秒退
       - package: AMSMB2
         product: AMSMB2
         embed: true
-      # Citadel + 依赖（swift-nio / swift-crypto）是静态库，已编译进主二进制
       - package: Citadel
         product: Citadel
     settings:
@@ -62,7 +64,6 @@ targets:
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: YES
         CODE_SIGN_ENTITLEMENTS: N1PhotoBackup.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
-        # 部分 SPM 包需要
         OTHER_LDFLAGS: "$(inherited) -ObjC"
       configs:
         Debug:

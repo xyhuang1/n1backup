@@ -9,8 +9,8 @@
 | 协议 | 典型场景 | 授权字段 | 实现 |
 |------|----------|----------|------|
 | **WebDAV** | Alist / Nextcloud / docker webdav | 主机、端口、HTTPS、用户、密码、基础路径 | 系统 URLSession（内置） |
-| **SMB / Samba** | iStoreOS Samba 共享 | 主机、端口、共享名、用户、密码、域、共享内路径 | AMSMB2（工程已集成） |
-| **SFTP** | OpenSSH / dropbear | 主机、端口、用户、密码、基础路径 | Citadel（工程已集成） |
+| **SMB / Samba** | iStoreOS Samba 共享 | 主机、端口、共享名、用户、密码、域、共享内路径 | AMSMB2 4.0.3（工程已集成并 embed） |
+| **SFTP** | OpenSSH / dropbear | 主机、端口、用户、密码或 OpenSSH 私钥、基础路径 | Citadel 0.12.1（工程已集成） |
 | **FTP / FTPS** | vsftpd 等 | 主机、端口、TLS、用户、密码、路径 | 系统 URLSession（内置） |
 
 四种协议 **均已接好**，无需再手动「添加 Swift 包」。CI / `xcodegen` 会自动拉取依赖。
@@ -62,7 +62,8 @@ HTTPS: 关
 主机: 192.168.1.10
 端口: 22
 用户 / 密码: root 或普通用户
-# 或打开「使用 SSH 私钥」粘贴私钥
+# 或打开「使用 SSH 私钥」，粘贴 OpenSSH 私钥（ed25519/RSA）：
+# -----BEGIN OPENSSH PRIVATE KEY-----
 基础路径: /mnt/sda1/PhoneBackup
 ```
 

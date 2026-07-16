@@ -1,7 +1,7 @@
 import Foundation
 import AMSMB2
 
-/// SMB / Samba（工程已链接 AMSMB2）
+/// SMB / Samba（AMSMB2 4.0.x）
 /// 连接在客户端生命周期内复用，操作经 SerialExecutor 串行，避免并发写冲突。
 final class SMBStorageClient: StorageClient, @unchecked Sendable {
     private let server: StorageServer
@@ -19,11 +19,11 @@ final class SMBStorageClient: StorageClient, @unchecked Sendable {
 
     func close() async {
         await gate.run { [self] in
-            if shareConnected {
-                manager?.disconnectShare()
+            if shareConnected, let manager {
+                try? await manager.disconnectShare()
                 shareConnected = false
             }
-            manager = nil
+            self.manager = nil
             ensuredDirs.removeAll()
         }
     }
@@ -31,11 +31,16 @@ final class SMBStorageClient: StorageClient, @unchecked Sendable {
     func testConnection() async throws {
         try await gate.run { [self] in
             let mgr = try await ensureConnected()
-            let root = server.normalizedBasePath
+            let root = normalizeSMBPath(server.normalizedBasePath)
             do {
                 _ = try await mgr.contentsOfDirectory(atPath: root.isEmpty ? "/" : root)
             } catch {
-                throw StorageError.connectionFailed(friendly(error))
+                // 根路径不存在时，至少验证共享可连
+                do {
+                    _ = try await mgr.contentsOfDirectory(atPath: "/")
+                } catch {
+                    throw StorageError.connectionFailed(friendly(error))
+                }
             }
         }
     }
@@ -92,7 +97,6 @@ final class SMBStorageClient: StorageClient, @unchecked Sendable {
             try await ensureDirectories(relativeDir: parent)
         }
 
-        // 大文件整读进内存是瓶颈，但 AMSMB2 的 write(data:) API 如此；后续可换流式 write
         let data = try Data(contentsOf: localURL, options: [.mappedIfSafe])
         let total = max(Double(data.count), 1)
         let path = normalizeSMBPath(server.joinedRemotePath(relativePath))
@@ -100,6 +104,7 @@ final class SMBStorageClient: StorageClient, @unchecked Sendable {
         try await gate.run { [self] in
             let mgr = try await ensureConnected()
             do {
+                // AMSMB2 4.0：write(data:toPath:progress:)
                 try await mgr.write(
                     data: data,
                     toPath: path,
