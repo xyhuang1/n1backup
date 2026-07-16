@@ -102,11 +102,11 @@ final class SMBStorageClient: StorageClient, @unchecked Sendable {
             do {
                 try await mgr.write(
                     data: data,
+                    toPath: path,
                     progress: { sent in
                         progress?(min(Double(sent) / total, 1))
                         return true
-                    },
-                    toPath: path
+                    }
                 )
                 progress?(1)
             } catch {
