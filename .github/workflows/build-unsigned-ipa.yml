@@ -73,6 +73,7 @@ jobs:
 
           # 关闭签名，仅编译 arm64 真机包（牛蛙等工具会再签）
           # 已链接 AMSMB2(SMB) + Citadel(SFTP)，WebDAV/FTP 系统自带
+          set -o pipefail
           xcodebuild build \
             -project N1PhotoBackup.xcodeproj \
             -scheme "$SCHEME" \
@@ -84,7 +85,9 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=YES \
             2>&1 | tee build/build.log
 
       - name: Pack IPA
@@ -101,6 +104,54 @@ jobs:
           echo "Found app: $APP_PATH"
           ls -la "$APP_PATH"
 
+          # ---- 关键：把 SPM 动态库塞进 .app/Frameworks ----
+          # AMSMB2 默认以 dynamic framework 产出；CODE_SIGNING_ALLOWED=NO 时
+          # Xcode 常常不执行 Embed Frameworks，导致重签后启动秒退（dyld missing）。
+          FRAMEWORKS_DIR="$APP_PATH/Frameworks"
+          mkdir -p "$FRAMEWORKS_DIR"
+
+          # 1) 已由 Xcode 嵌入的（若有）
+          # 2) PackageFrameworks 产物
+          while IFS= read -r fw; do
+            name=$(basename "$fw")
+            if [ ! -d "$FRAMEWORKS_DIR/$name" ]; then
+              echo "Embedding $fw"
+              cp -R "$fw" "$FRAMEWORKS_DIR/"
+            fi
+          done < <(find build/DerivedData -type d -name "*.framework" \
+            \( -path "*/PackageFrameworks/*" -o -path "*/Build/Products/*" \) 2>/dev/null \
+            | grep -v "${APP_NAME}.app" || true)
+
+          # 去掉签名痕迹，方便重签工具整体重签
+          find "$APP_PATH" \( -name "_CodeSignature" -o -name "CodeResources" \) -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$FRAMEWORKS_DIR" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+
+          echo "=== Frameworks in app ==="
+          ls -la "$FRAMEWORKS_DIR" || true
+
+          # 校验：主二进制若引用 @rpath/*.framework，则 Frameworks 里必须存在
+          BIN="$APP_PATH/${APP_NAME}"
+          if command -v otool >/dev/null 2>&1; then
+            echo "=== otool -L (first 40 lines) ==="
+            otool -L "$BIN" | head -40
+            missing=0
+            while read -r line; do
+              # 例如: @rpath/AMSMB2.framework/AMSMB2
+              fw=$(echo "$line" | sed -n 's/.*@rpath\/\([^/]*\.framework\).*/\1/p')
+              if [ -n "$fw" ] && [ ! -d "$FRAMEWORKS_DIR/$fw" ]; then
+                echo "❌ 缺少嵌入框架: $fw （来自: $line）"
+                missing=1
+              fi
+            done < <(otool -L "$BIN" | awk '{print $1}')
+            if [ "$missing" -ne 0 ]; then
+              echo "Frameworks 不完整，拒绝打包（否则装到手机必秒退）"
+              echo "PackageFrameworks 目录内容："
+              find build/DerivedData -type d -name "*.framework" | head -50
+              exit 1
+            fi
+            echo "✓ 所有 @rpath framework 均已嵌入"
+          fi
+
           # 标准 IPA 结构：Payload/xxx.app
           rm -rf build/Payload
           mkdir -p build/Payload
@@ -108,13 +159,17 @@ jobs:
 
           cd build
           rm -f "${APP_NAME}-unsigned.ipa"
-          # zip 即为 ipa
-          zip -r "${APP_NAME}-unsigned.ipa" Payload
+          # zip 即为 ipa（-y 保留符号链接）
+          zip -ry "${APP_NAME}-unsigned.ipa" Payload
           ls -lh "${APP_NAME}-unsigned.ipa"
 
           # 再打一份 .app.zip 方便部分工具导入
           ditto -c -k --sequesterRsrc --keepParent Payload/"${APP_NAME}.app" "${APP_NAME}.app.zip"
           ls -lh "${APP_NAME}.app.zip"
+
+          echo "=== Payload app layout ==="
+          find Payload/"${APP_NAME}.app" -maxdepth 2 -type d
+          ls -la Payload/"${APP_NAME}.app/Frameworks" || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -130,12 +185,13 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### 未签名 IPA 已生成"
+            echo "### 未签名 IPA 已生成（已嵌入动态 Framework）"
             echo ""
             echo "1. 下载 Artifact **N1PhotoBackup-unsigned-ipa**"
             echo "2. 解压得到 \`N1PhotoBackup-unsigned.ipa\`"
             echo "3. 用 **牛蛙助手** / 其他超级签名工具导入并签名安装"
             echo "4. Bundle ID 默认：\`${BUNDLE_ID}\`（签名时可被工具修改）"
+            echo "5. 最低系统：**iOS 17**"
             echo ""
-            echo "> 未签名包不能直接安装，必须重签。"
+            echo "> 若仍闪退：确认设备 ≥ iOS 17；签名时勾选「嵌入依赖 / 重签 Frameworks」。"
           } >> "$GITHUB_STEP_SUMMARY"
