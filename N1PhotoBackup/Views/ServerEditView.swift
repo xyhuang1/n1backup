@@ -50,7 +50,7 @@ struct ServerEditView: View {
     }
 
     private var connectionSection: some View {
-        Section("连接") {
+        Section {
             TextField("主机 IP / 域名", text: $server.host)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -63,6 +63,8 @@ struct ServerEditView: View {
                     .multilineTextAlignment(.trailing)
                     .frame(maxWidth: 100)
             }
+        } header: {
+            Text("连接")
         } footer: {
             Text("N1 / iStoreOS 一般开启系统 SSH，端口 22。")
         }
