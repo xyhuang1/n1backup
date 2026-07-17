@@ -52,6 +52,15 @@ N1PhotoBackup/
 └── Views/
 ```
 
+## 连接失败排查
+
+若测试连接出现 `NIOSSH.NIOSSHError 错误 1`：
+
+1. 确认已安装 **v1.5.1+**（该版本启用了与 Dropbear/旧 OpenSSH 兼容的算法）
+2. 手机与 N1 同一 Wi‑Fi，FinalShell / 系统 SSH 能用相同账号密码登录
+3. 主机填 **局域网 IP**（如 `192.168.1.10`），端口 **22**
+4. N1 上先 `mkdir -p /mnt/sda1/PhoneBackup` 并保证该用户可写
+
 ## License
 
 MIT

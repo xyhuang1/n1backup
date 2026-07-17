@@ -144,12 +144,19 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
         let port = server.port > 0 ? server.port : 22
         let client: SSHClient
         do {
+            // N1 / iStoreOS / OpenWrt 上的 Dropbear/OpenSSH 常使用较旧算法
+            // （AES-CTR、diffie-hellman-group14、ssh-rsa 主机密钥）。
+            // 默认 NIOSSH 算法集协商失败时，iOS 会把 NIOSSHError 显示成
+            // 「未能完成操作。NIOSSH.NIOSSHError 错误 1」。
+            // SSHAlgorithms.all 追加 AES128CTR + DH-group14 + RSA 主机密钥支持。
             client = try await SSHClient.connect(
                 host: host,
                 port: port,
                 authenticationMethod: auth,
                 hostKeyValidator: .acceptAnything(),
-                reconnect: .never
+                reconnect: .never,
+                algorithms: .all,
+                connectTimeout: .seconds(30)
             )
         } catch {
             throw StorageError.connectionFailed(friendly(error))
@@ -248,16 +255,42 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     }
 
     private func friendly(_ error: Error) -> String {
+        let ns = error as NSError
         let msg = error.localizedDescription
-        if msg.localizedCaseInsensitiveContains("auth")
-            || msg.localizedCaseInsensitiveContains("permission")
-            || msg.localizedCaseInsensitiveContains("denied")
-            || msg.localizedCaseInsensitiveContains("authentication") {
+        let detail = String(describing: error)
+        let blob = "\(msg) \(detail) \(ns.domain) \(ns.localizedFailureReason ?? "")"
+            .lowercased()
+
+        if blob.contains("allauthenticationoptionsfailed")
+            || blob.contains("authenticationfailed")
+            || blob.contains("unauthorized")
+            || blob.contains("invaliduserauthsignature") {
+            return "认证失败：请检查用户名/密码，或改用 OpenSSH 私钥（ed25519/RSA）。N1 需允许密码或公钥登录"
+        }
+        if blob.contains("permission") || blob.contains("denied") {
             return "认证失败或无权限：请检查用户名/密码/私钥，以及目录写权限"
         }
-        if msg.localizedCaseInsensitiveContains("timed out")
-            || msg.localizedCaseInsensitiveContains("timeout") {
-            return "连接超时：确认 N1 SSH 已开启，端口正确，与手机同一局域网"
+        if blob.contains("timed out") || blob.contains("timeout") {
+            return "连接超时：确认 N1 已开启 SSH、端口正确，手机与 N1 在同一 Wi‑Fi"
+        }
+        if blob.contains("keyexchangenegotiationfailure")
+            || blob.contains("algorithm")
+            || blob.contains("unsupportedversion") {
+            return "SSH 算法协商失败：N1 的 SSH 服务与客户端算法不匹配。请确认使用最新 App（已启用兼容算法）；仍失败时在 N1 检查 dropbear/sshd 配置"
+        }
+        if blob.contains("connection refused")
+            || blob.contains("could not connect")
+            || blob.contains("network is unreachable")
+            || blob.contains("no route to host")
+            || (blob.contains("socket") && blob.contains("not connected")) {
+            return "无法连到主机：检查 IP、端口（默认 22）、SSH 是否开启，以及是否在同一局域网"
+        }
+        // iOS 常把 NIOSSHError 显示成「错误 1」，给出可操作提示
+        if blob.contains("niossh") || ns.domain.localizedCaseInsensitiveContains("niossh") {
+            return "SSH 握手失败（\(detail)）。请确认：1) 主机/端口正确 2) N1 SSH 已开 3) 账号密码可用（FinalShell 能登录）4) 已安装含兼容算法的最新版 App"
+        }
+        if msg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return detail
         }
         return msg
     }
