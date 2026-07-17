@@ -34,6 +34,11 @@ git push -u origin main
 
 导入证书 → 导入上述 ipa → 签名 → 安装手机。
 
+**本仓库 v1.4+**：AMSMB2/Citadel 均为 **静态链接**，IPA 里没有 `AMSMB2.framework`。  
+重签时一般 **不用** 再勾「嵌入依赖 / Frameworks」；若工具强制重签 Frameworks 也可保持默认。
+
+要求：设备 **iOS 17+**。
+
 ---
 
 ## 说明
@@ -43,3 +48,10 @@ git push -u origin main
 「Build Unsigned IPA」就是帮你在云端免费编一次，产物你自己下。
 
 若你坚持用「证书进 CI 直接签好」，见 `docs/GITHUB_ACTIONS_IPA.md`（一般淘宝证书 + 牛蛙不需要那条路）。
+
+### 若仍安装失败
+
+1. 确认下载的是 **最新** Actions 产物（Artifact 名 `N1PhotoBackup-unsigned-ipa`，版本 ≥ 1.4.0）  
+2. 先删掉手机上旧版同名 App 再装  
+3. 证书描述文件设备 UDID 已加入、未过期  
+4. 系统 ≥ iOS 17

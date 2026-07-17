@@ -38,6 +38,12 @@ git push -u origin main
 4. 右侧 **Run workflow** → **Run workflow**  
 5. 等几分钟出现绿色 ✓  
 6. 点进这次运行 → 底部 **Artifacts**  
+7. 下载 **N1PhotoBackup-unsigned-ipa**，解压得到 `N1PhotoBackup-unsigned.ipa`
+
+> **v1.4+**：SMB（AMSMB2）与 SFTP（Citadel）均为 **静态链接**，IPA 内不应再出现 `AMSMB2.framework`。  
+> 若你装的是旧产物（仍含动态 AMSMB2），重签后很容易安装失败或秒退——请重新跑 Actions 下最新包。
+
+### ③ 牛蛙助手重签安装 
 7. 下载 **N1PhotoBackup-unsigned-ipa**  
 8. 解压 zip，得到：
 

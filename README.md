@@ -9,11 +9,12 @@
 | 协议 | 典型场景 | 授权字段 | 实现 |
 |------|----------|----------|------|
 | **WebDAV** | Alist / Nextcloud / docker webdav | 主机、端口、HTTPS、用户、密码、基础路径 | 系统 URLSession（内置） |
-| **SMB / Samba** | iStoreOS Samba 共享 | 主机、端口、共享名、用户、密码、域、共享内路径 | AMSMB2 4.0.3（工程已集成并 embed） |
-| **SFTP** | OpenSSH / dropbear | 主机、端口、用户、密码或 OpenSSH 私钥、基础路径 | Citadel 0.12.1（工程已集成） |
+| **SMB / Samba** | iStoreOS Samba 共享 | 主机、端口、共享名、用户、密码、域、共享内路径 | AMSMB2 4.0.3 **静态**（`ThirdParty/AMSMB2`） |
+| **SFTP** | OpenSSH / dropbear | 主机、端口、用户、密码或 OpenSSH 私钥、基础路径 | Citadel 0.12.1 **静态**（工程已集成） |
 | **FTP / FTPS** | vsftpd 等 | 主机、端口、TLS、用户、密码、路径 | 系统 URLSession（内置） |
 
-四种协议 **均已接好**，无需再手动「添加 Swift 包」。CI / `xcodegen` 会自动拉取依赖。
+四种协议 **均已接好**，无需再手动「添加 Swift 包」。  
+SMB 使用本地 **静态** AMSMB2（避免动态 framework 重签后装不上）；SFTP 用 Citadel（静态）。CI / `xcodegen` 会解析依赖。
 
 - 可保存**多台**服务器，备份前切换「当前目标」
 - 密码 / 私钥存 **Keychain**
