@@ -89,9 +89,9 @@ struct HomeView: View {
                     .pickerStyle(.menu)
                 }
             } else {
-                Text("尚未配置 SFTP")
+                Text("尚未配置备份服务器")
                     .foregroundStyle(.orange)
-                Text("请到「设置 → SFTP 服务器」添加主机、账号与备份路径。")
+                Text("请到「设置 → 备份服务器」添加 SFTP 或 WebDAV。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -170,6 +170,14 @@ struct HomeView: View {
                 Text(uploadManager.progressText)
                     .font(.subheadline.monospacedDigit())
                 Spacer()
+                if uploadManager.isRunning || uploadManager.itemsPerSecond > 0 {
+                    Label(uploadManager.speedText, systemImage: "bolt.fill")
+                        .font(.subheadline.monospacedDigit().weight(.medium))
+                        .foregroundStyle(.blue)
+                }
+            }
+            HStack {
+                Spacer()
                 Toggle("跳过已存在", isOn: $uploadManager.skipExisting)
                     .labelsHidden()
                 Text("跳过已存在")
@@ -191,11 +199,11 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("使用提示")
                 .font(.headline)
-            tipRow("设置里添加 SFTP：主机、端口 22、用户密码、/mnt/... 路径")
-            tipRow("可保存多台 SFTP，主页可切换当前目标")
-            tipRow("设置里可调并发（默认 3 路；不稳请降到 2）")
-            tipRow("上传中默认保持屏幕常亮，避免休眠中断")
-            tipRow("大量备份请插电并保持 App 前台")
+            tipRow("设置里添加 SFTP 或 WebDAV（AList 等）")
+            tipRow("可保存多台服务器，主页可切换当前目标")
+            tipRow("WebDAV 在 N1 上通常比多路 SFTP 更稳更快")
+            tipRow("设置可调并发（默认 3）；上传速度显示 张/s")
+            tipRow("上传中默认保持屏幕常亮；大量备份请插电")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()

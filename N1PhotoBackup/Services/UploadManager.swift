@@ -13,9 +13,13 @@ final class UploadManager: ObservableObject {
     @Published var skipExisting: Bool = true
     @Published private(set) var finishedCount: Int = 0
     @Published private(set) var totalCount: Int = 0
+    /// 近几秒完成速度（张/秒，含成功+跳过）
+    @Published private(set) var itemsPerSecond: Double = 0
+    /// 用于 UI：`2.3 张/s` 或 `—`
+    @Published private(set) var speedText: String = "—"
 
-    /// 并发上传路数（每路独立 SFTP 连接）。1–6，默认 3。
-    /// N1/Dropbear 并发 SSH 过多易断连（NIOCore.IOError），默认不宜过高。
+    /// 并发上传路数（每路独立连接）。1–6，默认 3。
+    /// SFTP 在 N1/Dropbear 上并发过高易断连；WebDAV 可适当调高。
     @Published var maxConcurrentUploads: Int {
         didSet {
             let clamped = Self.clampConcurrency(maxConcurrentUploads)
@@ -40,16 +44,20 @@ final class UploadManager: ObservableObject {
     private var lastProgressAt: [String: CFAbsoluteTime] = [:]
     private let progressMinInterval: CFAbsoluteTime = 0.2
 
+    /// 完成时间戳滑动窗口，用于计算张/秒
+    private var completionTimestamps: [CFAbsoluteTime] = []
+    private let speedWindowSeconds: CFAbsoluteTime = 8
+    private var lastSpeedUIUpdate: CFAbsoluteTime = 0
+
     private static let concurrencyKey = "upload_max_concurrent_v1"
     private static let keepScreenKey = "upload_keep_screen_on_v1"
     static let minConcurrency = 1
     static let maxConcurrency = 6
-    /// 默认 3：在 N1 上比 4 更稳，吞吐通常不差（少断连重试）
+    /// 默认 3：SFTP 在 N1 上更稳；WebDAV 可在设置里调高
     static let defaultConcurrency = 3
 
     private init() {
         let saved = UserDefaults.standard.object(forKey: Self.concurrencyKey) as? Int
-        // 旧默认 4 的用户保留其设置；新安装用 3
         maxConcurrentUploads = Self.clampConcurrency(saved ?? Self.defaultConcurrency)
         if UserDefaults.standard.object(forKey: Self.keepScreenKey) == nil {
             keepScreenOn = true
@@ -145,6 +153,9 @@ final class UploadManager: ObservableObject {
         isRunning = false
         items.removeAll()
         lastProgressAt.removeAll()
+        completionTimestamps.removeAll()
+        itemsPerSecond = 0
+        speedText = "—"
         totalCount = 0
         finishedCount = 0
         applyIdleTimerPolicy()
@@ -173,19 +184,30 @@ final class UploadManager: ObservableObject {
         guard task == nil else { return }
         isRunning = true
         lastError = nil
+        // 新一轮任务：重置速度窗口，避免旧数据干扰
+        completionTimestamps.removeAll()
+        itemsPerSecond = 0
+        speedText = "—"
         applyIdleTimerPolicy()
         task = Task { [weak self] in
             await self?.runLoop()
         }
     }
 
-    /// 持续工作池：N 个 worker 各自独立 SFTP，取完一条立刻取下一条（无批次屏障）。
-    /// 建连错开，避免同时握手压垮 Dropbear。
+    /// 持续工作池：N 个 worker 各自独立连接，取完一条立刻取下一条（无批次屏障）。
+    /// SFTP 建连错开，避免同时握手压垮 Dropbear；WebDAV 几乎无握手成本。
     private func runLoop() async {
         defer {
             isRunning = false
             task = nil
             applyIdleTimerPolicy()
+            // 结束后保留最后一次速度约 2 秒可读，随后清零
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, !self.isRunning else { return }
+                self.itemsPerSecond = 0
+                self.speedText = "—"
+            }
         }
 
         guard let server = ServerStore.shared.selectedServer else {
@@ -194,6 +216,8 @@ final class UploadManager: ObservableObject {
         }
         let credentials = ServerStore.shared.credentials(for: server)
         let concurrency = Self.clampConcurrency(maxConcurrentUploads)
+        // SFTP 需要错开建连；WebDAV 可并行立刻开
+        let staggerNs: UInt64 = server.protocolKind == .sftp ? 500_000_000 : 80_000_000
 
         await withTaskGroup(of: Void.self) { group in
             for workerIndex in 0..<concurrency {
@@ -201,7 +225,8 @@ final class UploadManager: ObservableObject {
                     await self?.workerLoop(
                         workerIndex: workerIndex,
                         server: server,
-                        credentials: credentials
+                        credentials: credentials,
+                        staggerNs: staggerNs
                     )
                 }
             }
@@ -211,11 +236,12 @@ final class UploadManager: ObservableObject {
     private nonisolated func workerLoop(
         workerIndex: Int,
         server: StorageServer,
-        credentials: ServerCredentials
+        credentials: ServerCredentials,
+        staggerNs: UInt64
     ) async {
-        // 错开建连：0 / 0.5s / 1.0s …
+        // 错开建连：0 / stagger / 2*stagger …
         if workerIndex > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(workerIndex) * 500_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(workerIndex) * staggerNs)
         }
         if Task.isCancelled { return }
 
@@ -347,11 +373,59 @@ final class UploadManager: ObservableObject {
 
     fileprivate func update(itemId: String, status: UploadStatus) {
         guard let i = items.firstIndex(where: { $0.id == itemId }) else { return }
+        let wasFinished = items[i].status.isFinished
         items[i].status = status
         if status.isFinished {
             lastProgressAt.removeValue(forKey: itemId)
+            // 成功/跳过计入吞吐；失败不算速度
+            if !wasFinished {
+                switch status {
+                case .succeeded, .skipped:
+                    recordCompletion()
+                default:
+                    break
+                }
+            }
         }
         recomputeFinished()
+    }
+
+    private func recordCompletion() {
+        let now = CFAbsoluteTimeGetCurrent()
+        completionTimestamps.append(now)
+        pruneAndPublishSpeed(now: now, force: true)
+    }
+
+    private func pruneAndPublishSpeed(now: CFAbsoluteTime, force: Bool) {
+        let cutoff = now - speedWindowSeconds
+        completionTimestamps.removeAll { $0 < cutoff }
+        if !force, now - lastSpeedUIUpdate < 0.4 { return }
+        lastSpeedUIUpdate = now
+
+        guard let first = completionTimestamps.first, completionTimestamps.count >= 1 else {
+            itemsPerSecond = 0
+            if !isRunning { speedText = "—" }
+            return
+        }
+        // 窗口内样本不足时用已过去的实际时长
+        let elapsed = max(now - first, 0.5)
+        let rate = Double(completionTimestamps.count) / elapsed
+        itemsPerSecond = rate
+        if rate >= 10 {
+            speedText = String(format: "%.0f 张/s", rate)
+        } else if rate >= 1 {
+            speedText = String(format: "%.1f 张/s", rate)
+        } else if rate > 0 {
+            // 慢速时显示 张/分钟 更直观，同时保留 张/s
+            let perMin = rate * 60
+            if perMin >= 1 {
+                speedText = String(format: "%.1f 张/s (≈%.0f/分)", rate, perMin)
+            } else {
+                speedText = String(format: "%.2f 张/s", rate)
+            }
+        } else {
+            speedText = "—"
+        }
     }
 
     fileprivate func updateProgress(itemId: String, progress: Double) {
@@ -391,5 +465,9 @@ final class UploadManager: ObservableObject {
     private func recomputeFinished() {
         finishedCount = items.filter { $0.status.isFinished }.count
         totalCount = items.count
+        // 运行中定期刷新速度窗口（即使暂时无完成项也衰减）
+        if isRunning {
+            pruneAndPublishSpeed(now: CFAbsoluteTimeGetCurrent(), force: false)
+        }
     }
 }

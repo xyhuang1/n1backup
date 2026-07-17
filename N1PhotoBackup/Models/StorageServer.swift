@@ -1,6 +1,6 @@
 import Foundation
 
-/// 一条可保存的 SFTP 服务器连接（密码/私钥走 Keychain）
+/// 一条可保存的存储服务器连接（密码/私钥走 Keychain）
 struct StorageServer: Codable, Equatable, Identifiable, Hashable {
     var id: UUID
     var name: String
@@ -9,19 +9,22 @@ struct StorageServer: Codable, Equatable, Identifiable, Hashable {
     var host: String
     var port: Int
     var username: String
-    /// 远程备份根路径，如 `/mnt/sda1/PhoneBackup`
+    /// 远程备份根路径。SFTP: `/mnt/sda1/PhoneBackup`；WebDAV: `/dav/.../PhoneBackup`
     var basePath: String
 
-    /// 是否优先用私钥（私钥正文存 Keychain）
+    /// SFTP：是否优先用私钥（私钥正文存 Keychain）
     var usePrivateKey: Bool
+
+    /// WebDAV：HTTPS
+    var useTLS: Bool
+    /// WebDAV：忽略自签证书
+    var allowInsecureTLS: Bool
 
     var folderLayout: FolderLayout
     var createdAt: Date
     var updatedAt: Date
 
-    // 旧版多协议字段：解码兼容，新配置不再使用
-    var useTLS: Bool
-    var allowInsecureTLS: Bool
+    // 旧版 SMB/FTP 字段：解码兼容，新配置不再使用
     var shareName: String
     var domain: String
     var workgroup: String
@@ -68,7 +71,7 @@ struct StorageServer: Codable, Equatable, Identifiable, Hashable {
     ) {
         self.id = id
         self.name = name
-        self.protocolKind = .sftp
+        self.protocolKind = protocolKind
         self.host = host
         self.port = port
         self.username = username
@@ -89,12 +92,17 @@ struct StorageServer: Codable, Equatable, Identifiable, Hashable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
-        // 旧版若存了 webdav/smb/ftp，统一按 SFTP 读；用户需改端口/路径
-        protocolKind = .sftp
+        // 旧版若存了 smb/ftp 等，回退为 SFTP
+        if let raw = try c.decodeIfPresent(String.self, forKey: .protocolKind),
+           let kind = StorageProtocolKind(rawValue: raw) {
+            protocolKind = kind
+        } else {
+            protocolKind = .sftp
+        }
         host = try c.decodeIfPresent(String.self, forKey: .host) ?? ""
-        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 22
+        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? protocolKind.defaultPort
         username = try c.decodeIfPresent(String.self, forKey: .username) ?? ""
-        basePath = try c.decodeIfPresent(String.self, forKey: .basePath) ?? "/PhoneBackup"
+        basePath = try c.decodeIfPresent(String.self, forKey: .basePath) ?? protocolKind.defaultBasePath
         usePrivateKey = try c.decodeIfPresent(Bool.self, forKey: .usePrivateKey) ?? false
         folderLayout = try c.decodeIfPresent(FolderLayout.self, forKey: .folderLayout) ?? .yearMonth
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
@@ -105,14 +113,14 @@ struct StorageServer: Codable, Equatable, Identifiable, Hashable {
         domain = try c.decodeIfPresent(String.self, forKey: .domain) ?? ""
         workgroup = try c.decodeIfPresent(String.self, forKey: .workgroup) ?? "WORKGROUP"
         ftpPassive = try c.decodeIfPresent(Bool.self, forKey: .ftpPassive) ?? true
-        if port <= 0 { port = 22 }
+        if port <= 0 { port = protocolKind.defaultPort }
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
         try c.encode(name, forKey: .name)
-        try c.encode(StorageProtocolKind.sftp, forKey: .protocolKind)
+        try c.encode(protocolKind, forKey: .protocolKind)
         try c.encode(host, forKey: .host)
         try c.encode(port, forKey: .port)
         try c.encode(username, forKey: .username)
@@ -121,32 +129,43 @@ struct StorageServer: Codable, Equatable, Identifiable, Hashable {
         try c.encode(folderLayout, forKey: .folderLayout)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(updatedAt, forKey: .updatedAt)
+        try c.encode(useTLS, forKey: .useTLS)
+        try c.encode(allowInsecureTLS, forKey: .allowInsecureTLS)
     }
 
     static func blank(protocol kind: StorageProtocolKind = .sftp) -> StorageServer {
         StorageServer(
             id: UUID(),
             name: "",
-            protocolKind: .sftp,
+            protocolKind: kind,
             host: "",
-            port: 22,
+            port: kind.defaultPort,
             username: "",
-            basePath: "/mnt/sda1/PhoneBackup",
+            basePath: kind.defaultBasePath,
             usePrivateKey: false,
-            folderLayout: .yearMonth
+            folderLayout: .yearMonth,
+            useTLS: false,
+            allowInsecureTLS: true
         )
     }
 
     var displayTitle: String {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !n.isEmpty { return n }
-        if host.isEmpty { return "未命名 SFTP" }
-        return "SFTP · \(host)"
+        if host.isEmpty { return "未命名 \(protocolKind.title)" }
+        return "\(protocolKind.title) · \(host)"
     }
 
     var summaryLine: String {
-        var parts: [String] = ["SFTP"]
-        if !host.isEmpty { parts.append("\(host):\(port)") }
+        var parts: [String] = [protocolKind.title]
+        if !host.isEmpty {
+            let scheme: String
+            switch protocolKind {
+            case .webdav: scheme = useTLS ? "https" : "http"
+            case .sftp: scheme = "sftp"
+            }
+            parts.append("\(scheme)://\(host):\(port)")
+        }
         if !basePath.isEmpty { parts.append(basePath) }
         return parts.joined(separator: "  ")
     }
@@ -161,7 +180,6 @@ struct StorageServer: Codable, Equatable, Identifiable, Hashable {
 
     mutating func touch() {
         updatedAt = Date()
-        protocolKind = .sftp
     }
 
     func joinedRemotePath(_ relative: String) -> String {

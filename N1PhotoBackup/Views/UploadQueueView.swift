@@ -24,6 +24,13 @@ struct UploadQueueView: View {
                                     .monospacedDigit()
                             }
                             ProgressView(value: uploadManager.overallProgress)
+                            HStack {
+                                Text("上传速度")
+                                Spacer()
+                                Text(uploadManager.speedText)
+                                    .foregroundStyle(uploadManager.isRunning ? .blue : .secondary)
+                                    .monospacedDigit()
+                            }
                         }
 
                         Section("任务 (\(uploadManager.items.count))") {

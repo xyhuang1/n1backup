@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-/// 多台 SFTP 服务器 + 当前选中项
+/// 多台备份服务器（SFTP / WebDAV）+ 当前选中项
 @MainActor
 final class ServerStore: ObservableObject {
     static let shared = ServerStore()

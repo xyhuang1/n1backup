@@ -14,8 +14,13 @@ struct ServerEditView: View {
     @State private var testOK = false
     @State private var showDeleteConfirm = false
 
+    private var fields: Set<ServerFormField> {
+        server.protocolKind.formFields
+    }
+
     var body: some View {
         Form {
+            protocolSection
             identitySection
             connectionSection
             authSection
@@ -23,7 +28,7 @@ struct ServerEditView: View {
             actionSection
             helpSection
         }
-        .navigationTitle(isNew ? "新建 SFTP" : "编辑 SFTP")
+        .navigationTitle(isNew ? "新建连接" : "编辑连接")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -34,12 +39,49 @@ struct ServerEditView: View {
                     .fontWeight(.semibold)
             }
         }
+        .onChange(of: server.protocolKind) { _, newKind in
+            server.port = newKind.defaultPort
+            let defaults = Set(StorageProtocolKind.allCases.map(\.defaultBasePath))
+            if server.basePath.isEmpty || defaults.contains(server.basePath)
+                || server.basePath == "/PhoneBackup" || server.basePath == "PhoneBackup" {
+                server.basePath = newKind.defaultBasePath
+            }
+            if newKind != .sftp {
+                server.usePrivateKey = false
+            }
+            if newKind != .webdav {
+                server.useTLS = false
+            }
+        }
         .confirmationDialog("删除此服务器？", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
             Button("删除", role: .destructive) {
                 serverStore.delete(id: server.id)
                 dismiss()
             }
             Button("取消", role: .cancel) {}
+        }
+    }
+
+    // MARK: - Sections
+
+    private var protocolSection: some View {
+        Section {
+            Picker("协议", selection: $server.protocolKind) {
+                ForEach(StorageProtocolKind.allCases) { kind in
+                    Label(kind.title, systemImage: kind.systemImage).tag(kind)
+                }
+            }
+            .disabled(!isNew)
+
+            if !isNew {
+                Text("如需换协议，请新建一条连接。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("协议类型")
+        } footer: {
+            Text(server.protocolKind.subtitle)
         }
     }
 
@@ -63,10 +105,22 @@ struct ServerEditView: View {
                     .multilineTextAlignment(.trailing)
                     .frame(maxWidth: 100)
             }
+            if fields.contains(.useTLS) {
+                Toggle("使用 HTTPS", isOn: $server.useTLS)
+            }
+            if fields.contains(.allowInsecureTLS) {
+                Toggle("忽略证书校验（内网自签）", isOn: $server.allowInsecureTLS)
+                    .disabled(!server.useTLS)
+            }
         } header: {
             Text("连接")
         } footer: {
-            Text("N1 / iStoreOS 一般开启系统 SSH，端口 22。")
+            switch server.protocolKind {
+            case .sftp:
+                Text("N1 / iStoreOS 一般开启系统 SSH，端口 22。")
+            case .webdav:
+                Text("AList 默认 5244；其它 WebDAV 常见 80/8080/5005。局域网可关 HTTPS。")
+            }
         }
     }
 
@@ -90,21 +144,27 @@ struct ServerEditView: View {
                 }
                 .buttonStyle(.borderless)
             }
-            Toggle("使用 SSH 私钥", isOn: $server.usePrivateKey)
-            if server.usePrivateKey {
-                Text("OpenSSH 私钥正文（ed25519 / RSA）")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextEditor(text: $credentials.privateKey)
-                    .font(.system(.footnote, design: .monospaced))
-                    .frame(minHeight: 120)
-                SecureField("私钥口令（可选）", text: $credentials.passphrase)
-                    .textInputAutocapitalization(.never)
+            if fields.contains(.privateKey) {
+                Toggle("使用 SSH 私钥", isOn: $server.usePrivateKey)
+                if server.usePrivateKey {
+                    Text("OpenSSH 私钥正文（ed25519 / RSA）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $credentials.privateKey)
+                        .font(.system(.footnote, design: .monospaced))
+                        .frame(minHeight: 120)
+                    SecureField("私钥口令（可选）", text: $credentials.passphrase)
+                        .textInputAutocapitalization(.never)
+                }
             }
         } header: {
             Text("授权")
         } footer: {
-            Text("密码与私钥保存在系统钥匙串。推荐密码登录；私钥需 OpenSSH 格式（-----BEGIN OPENSSH PRIVATE KEY-----）。")
+            if server.protocolKind == .sftp {
+                Text("密码与私钥保存在系统钥匙串。推荐密码登录；私钥需 OpenSSH 格式。")
+            } else {
+                Text("WebDAV Basic 认证；密码保存在系统钥匙串。")
+            }
         }
     }
 
@@ -121,7 +181,12 @@ struct ServerEditView: View {
         } header: {
             Text("备份路径")
         } footer: {
-            Text("SSH 用户可见的绝对路径，如 /mnt/sda1/PhoneBackup。请先 mkdir 并确保可写。")
+            switch server.protocolKind {
+            case .sftp:
+                Text("SSH 用户可见的绝对路径，如 /mnt/sda1/PhoneBackup。请先 mkdir 并确保可写。")
+            case .webdav:
+                Text("AList 示例：/dav/本地存储/PhoneBackup ；通用 WebDAV 多为 /PhoneBackup。路径须可写。")
+            }
         }
     }
 
@@ -157,22 +222,42 @@ struct ServerEditView: View {
     }
 
     private var helpSection: some View {
-        Section("填写示例") {
-            Text("• 主机：192.168.1.10")
-            Text("• 端口：22")
-            Text("• 用户 / 密码：root 或普通用户")
-            Text("• 基础路径：/mnt/sda1/PhoneBackup")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        Section("填写示例 · \(server.protocolKind.title)") {
+            ForEach(helpLines, id: \.self) { line in
+                Text("• \(line)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
+    private var helpLines: [String] {
+        switch server.protocolKind {
+        case .sftp:
+            return [
+                "主机：192.168.1.10",
+                "端口：22",
+                "用户 / 密码：root 或普通用户",
+                "基础路径：/mnt/sda1/PhoneBackup"
+            ]
+        case .webdav:
+            return [
+                "主机：N1 局域网 IP",
+                "端口：AList 默认 5244",
+                "用户名/密码：WebDAV 服务账号",
+                "基础路径：可写目录，如 /dav/本地存储/PhoneBackup",
+                "内网自签 HTTPS：开 HTTPS 并勾选忽略证书"
+            ]
+        }
+    }
+
+    // MARK: - Actions
+
     private func save(andDismiss: Bool) {
-        server.protocolKind = .sftp
         server.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
         server.name = server.name.trimmingCharacters(in: .whitespacesAndNewlines)
         server.basePath = server.basePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if server.port <= 0 { server.port = 22 }
+        if server.port <= 0 { server.port = server.protocolKind.defaultPort }
         serverStore.upsert(server, credentials: credentials)
         if andDismiss { dismiss() }
     }
@@ -189,7 +274,7 @@ struct ServerEditView: View {
             defer { Task { await client.close() } }
             try await client.testConnection()
             testOK = true
-            testMessage = "SFTP 连接成功 ✓  可以开始备份"
+            testMessage = "\(server.protocolKind.title) 连接成功 ✓  可以开始备份"
         } catch {
             testOK = false
             testMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

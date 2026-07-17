@@ -24,7 +24,7 @@ enum StorageError: LocalizedError {
     }
 }
 
-/// 统一存储上传接口（本应用仅 SFTP 实现）
+/// 统一存储上传接口（SFTP / WebDAV）
 protocol StorageClient: AnyObject {
     func testConnection() async throws
     func remoteExists(relativePath: String) async throws -> Bool
@@ -55,6 +55,11 @@ enum StorageClientFactory {
         guard !host.isEmpty else {
             throw StorageError.invalidConfiguration("主机地址不能为空")
         }
-        return SFTPStorageClient(server: server, credentials: credentials)
+        switch server.protocolKind {
+        case .sftp:
+            return SFTPStorageClient(server: server, credentials: credentials)
+        case .webdav:
+            return WebDAVStorageClient(server: server, credentials: credentials)
+        }
     }
 }

@@ -4,15 +4,16 @@ struct ServerListView: View {
     @EnvironmentObject private var serverStore: ServerStore
     @State private var editing: StorageServer?
     @State private var isCreating = false
+    @State private var createProtocol: StorageProtocolKind = .sftp
 
     var body: some View {
         List {
             if serverStore.servers.isEmpty {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("还没有 SFTP 服务器")
+                        Text("还没有备份服务器")
                             .font(.headline)
-                        Text("点右上角「+」，填写主机、端口、账号密码与备份路径后保存。")
+                        Text("点右上角「+」，选择 SFTP 或 WebDAV，填写主机与备份路径后保存。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -54,27 +55,45 @@ struct ServerListView: View {
                         }
                     }
                 } header: {
-                    Text("已保存的 SFTP")
+                    Text("已保存的服务器")
                 } footer: {
-                    Text("点按设为当前目标；备份使用带绿色 ✓ 的那一条。")
+                    Text("点按设为当前目标；备份使用带绿色 ✓ 的那一条。支持 SFTP 与 WebDAV。")
                 }
             }
 
             Section {
                 Button {
+                    createProtocol = .sftp
                     isCreating = true
                 } label: {
-                    Label("添加 SFTP 服务器", systemImage: "plus.circle.fill")
+                    Label("添加 SFTP", systemImage: "terminal")
+                }
+                Button {
+                    createProtocol = .webdav
+                    isCreating = true
+                } label: {
+                    Label("添加 WebDAV", systemImage: "globe")
                 }
             } footer: {
-            Text("仅支持 SFTP。N1 上开启 SSH，并保证用户对 USB 目录可写。")
+                Text("WebDAV（AList 等）在 N1 上通常比多路 SFTP 更稳、更省 CPU。")
             }
         }
-        .navigationTitle("SFTP 服务器")
+        .navigationTitle("备份服务器")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    isCreating = true
+                Menu {
+                    Button {
+                        createProtocol = .sftp
+                        isCreating = true
+                    } label: {
+                        Label("SFTP", systemImage: "terminal")
+                    }
+                    Button {
+                        createProtocol = .webdav
+                        isCreating = true
+                    } label: {
+                        Label("WebDAV", systemImage: "globe")
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -83,7 +102,7 @@ struct ServerListView: View {
         .sheet(isPresented: $isCreating) {
             NavigationStack {
                 ServerEditView(
-                    server: StorageServer.blank(),
+                    server: StorageServer.blank(protocol: createProtocol),
                     credentials: .empty,
                     isNew: true
                 )

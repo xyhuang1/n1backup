@@ -1,8 +1,8 @@
-# XcodeGen — 仅 SFTP（Citadel 静态库）
+# XcodeGen — SFTP（Citadel 静态）+ WebDAV（系统 URLSession）
 # 生成: xcodegen generate
 #
 # Citadel + NIO/Crypto 均为静态链接，链进主二进制，无需 embed framework。
-# 未签名 IPA 重签后即可安装（与第一版结构一致，仅多一个静态 SPM 依赖）。
+# WebDAV 无第三方依赖。未签名 IPA 重签后即可安装。
 
 name: N1PhotoBackup
 
@@ -23,8 +23,8 @@ settings:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    CURRENT_PROJECT_VERSION: "9"
-    MARKETING_VERSION: "1.6.1"
+    CURRENT_PROJECT_VERSION: "10"
+    MARKETING_VERSION: "1.7.0"
     CODE_SIGN_STYLE: Manual
     ENABLE_USER_SCRIPT_SANDBOXING: false
     CLANG_ENABLE_MODULES: YES
