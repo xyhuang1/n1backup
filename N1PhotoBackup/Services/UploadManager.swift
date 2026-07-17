@@ -14,7 +14,8 @@ final class UploadManager: ObservableObject {
     @Published private(set) var finishedCount: Int = 0
     @Published private(set) var totalCount: Int = 0
 
-    /// 并发上传路数（每路独立 SFTP 连接）。1–8，默认 4。
+    /// 并发上传路数（每路独立 SFTP 连接）。1–6，默认 3。
+    /// N1/Dropbear 并发 SSH 过多易断连（NIOCore.IOError），默认不宜过高。
     @Published var maxConcurrentUploads: Int {
         didSet {
             let clamped = Self.clampConcurrency(maxConcurrentUploads)
@@ -42,11 +43,13 @@ final class UploadManager: ObservableObject {
     private static let concurrencyKey = "upload_max_concurrent_v1"
     private static let keepScreenKey = "upload_keep_screen_on_v1"
     static let minConcurrency = 1
-    static let maxConcurrency = 8
-    static let defaultConcurrency = 4
+    static let maxConcurrency = 6
+    /// 默认 3：在 N1 上比 4 更稳，吞吐通常不差（少断连重试）
+    static let defaultConcurrency = 3
 
     private init() {
         let saved = UserDefaults.standard.object(forKey: Self.concurrencyKey) as? Int
+        // 旧默认 4 的用户保留其设置；新安装用 3
         maxConcurrentUploads = Self.clampConcurrency(saved ?? Self.defaultConcurrency)
         if UserDefaults.standard.object(forKey: Self.keepScreenKey) == nil {
             keepScreenOn = true
@@ -160,12 +163,11 @@ final class UploadManager: ObservableObject {
     // MARK: - Idle timer (screen awake)
 
     private func applyIdleTimerPolicy() {
-        // 仅在「上传中且开启常亮」时禁用休眠
         let shouldKeepOn = isRunning && keepScreenOn
         UIApplication.shared.isIdleTimerDisabled = shouldKeepOn
     }
 
-    // MARK: - Worker
+    // MARK: - Worker pool
 
     private func startIfNeeded() {
         guard task == nil else { return }
@@ -177,6 +179,8 @@ final class UploadManager: ObservableObject {
         }
     }
 
+    /// 持续工作池：N 个 worker 各自独立 SFTP，取完一条立刻取下一条（无批次屏障）。
+    /// 建连错开，避免同时握手压垮 Dropbear。
     private func runLoop() async {
         defer {
             isRunning = false
@@ -191,58 +195,91 @@ final class UploadManager: ObservableObject {
         let credentials = ServerStore.shared.credentials(for: server)
         let concurrency = Self.clampConcurrency(maxConcurrentUploads)
 
-        // 每路并发使用独立 SFTP 连接：单连接内仍串行，多连接才能真正提速
-        var clients: [StorageClient] = []
-        clients.reserveCapacity(concurrency)
-        do {
-            for _ in 0..<concurrency {
-                clients.append(try StorageClientFactory.make(server: server, credentials: credentials))
+        await withTaskGroup(of: Void.self) { group in
+            for workerIndex in 0..<concurrency {
+                group.addTask { [weak self] in
+                    await self?.workerLoop(
+                        workerIndex: workerIndex,
+                        server: server,
+                        credentials: credentials
+                    )
+                }
             }
+        }
+    }
+
+    private nonisolated func workerLoop(
+        workerIndex: Int,
+        server: StorageServer,
+        credentials: ServerCredentials
+    ) async {
+        // 错开建连：0 / 0.5s / 1.0s …
+        if workerIndex > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(workerIndex) * 500_000_000)
+        }
+        if Task.isCancelled { return }
+
+        let client: StorageClient
+        do {
+            client = try StorageClientFactory.make(server: server, credentials: credentials)
         } catch {
             let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            lastError = msg
-            for i in items.indices where items[i].status == .pending {
-                items[i].status = .failed(msg)
+            await MainActor.run {
+                UploadManager.shared.noteError(msg)
             }
-            recomputeFinished()
             return
         }
+        defer {
+            Task { await client.close() }
+        }
 
-        await withTaskCancellationHandler {
-            let skip = skipExisting
-            while !Task.isCancelled {
-                let pending = items.filter { $0.status == .pending }
-                if pending.isEmpty { break }
+        let skip = await MainActor.run { UploadManager.shared.skipExisting }
 
-                let batch = Array(pending.prefix(clients.count))
-                await withTaskGroup(of: Void.self) { group in
-                    for (index, item) in batch.enumerated() {
-                        let snapshot = item
-                        let client = clients[index]
-                        group.addTask { [weak self] in
-                            await self?.process(
-                                snapshot,
-                                client: client,
-                                server: server,
-                                skipExisting: skip
-                            )
+        while !Task.isCancelled {
+            guard let item = await MainActor.run(body: { UploadManager.shared.claimNextPending() }) else {
+                // 短暂等待，可能有新任务入队或其它 worker 失败回 pending
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                let stillRunning = await MainActor.run { () -> Bool in
+                    let hasPending = UploadManager.shared.items.contains { $0.status == .pending }
+                    let hasActive = UploadManager.shared.items.contains {
+                        switch $0.status {
+                        case .checking, .exporting, .uploading: return true
+                        default: return false
                         }
                     }
+                    return hasPending || hasActive
                 }
-                recomputeFinished()
-            }
-        } onCancel: {
-            // 取消时尽快释放连接（close 幂等）
-            Task {
-                for c in clients {
-                    await c.close()
+                // 若全局已无 pending 且无活跃任务，本 worker 退出
+                // 注意：其它 worker 可能仍在 exporting；hasActive 会挡住
+                // 仅当完全没有 pending 时退出；active 由各自 worker 自己负责
+                let hasPending = await MainActor.run {
+                    UploadManager.shared.items.contains { $0.status == .pending }
                 }
+                if !hasPending {
+                    // 再确认没有自己可领的
+                    if stillRunning {
+                        // 还有人在干活，但没有 pending —— 本 worker 可退出
+                        break
+                    }
+                    break
+                }
+                continue
             }
-        }
 
-        for c in clients {
-            await c.close()
+            await process(
+                item,
+                client: client,
+                server: server,
+                skipExisting: skip
+            )
         }
+    }
+
+    /// 原子领取下一条 pending，并标为 checking，避免多 worker 抢同一条
+    fileprivate func claimNextPending() -> UploadItem? {
+        guard let i = items.firstIndex(where: { $0.status == .pending }) else { return nil }
+        items[i].status = .checking
+        return items[i]
     }
 
     private nonisolated func process(
@@ -273,7 +310,6 @@ final class UploadManager: ObservableObject {
             let exported = try await PhotoLibraryService.exportOriginal(asset: asset)
             defer { try? FileManager.default.removeItem(at: exported.fileURL) }
 
-            // 导出后的真实文件名可能与预估不同；保持入队时的 unique 名，仅在远程路径日期上对齐
             let remotePath = DatePath.remoteRelativePath(
                 fileName: item.fileName,
                 date: exported.creationDate ?? item.creationDate,
@@ -327,7 +363,6 @@ final class UploadManager: ObservableObject {
         }
         lastProgressAt[itemId] = now
         guard let i = items.firstIndex(where: { $0.id == itemId }) else { return }
-        // 仅在仍处于上传态时更新，避免覆盖终态
         if case .uploading = items[i].status {
             items[i].status = .uploading(progress: min(max(progress, 0), 1))
         } else if case .pending = items[i].status {
@@ -346,6 +381,10 @@ final class UploadManager: ObservableObject {
 
     fileprivate func markFailed(itemId: String, message: String) {
         update(itemId: itemId, status: .failed(message))
+        lastError = message
+    }
+
+    fileprivate func noteError(_ message: String) {
         lastError = message
     }
 

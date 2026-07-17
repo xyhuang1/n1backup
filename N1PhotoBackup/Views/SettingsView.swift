@@ -67,7 +67,7 @@ struct SettingsView: View {
                 } header: {
                     Text("上传选项")
                 } footer: {
-                    Text("每路使用独立 SFTP 连接。路数越高速度通常越快，但更占带宽与 N1 CPU；Wi‑Fi 较弱时可降到 2。常亮仅在上传进行中生效。")
+                    Text("每路独立 SFTP 连接，持续取任务（无批次等待）。N1/Dropbear 并发过高易断连，建议 2–3；不稳就降到 2。常亮仅在上传进行中生效。")
                 }
 
                 Section("N1 / iStoreOS") {
@@ -82,7 +82,7 @@ struct SettingsView: View {
                 Section("关于") {
                     LabeledContent("应用", value: "N1 相册备份")
                     LabeledContent("协议", value: "SFTP only")
-                    LabeledContent("版本", value: "1.6.0")
+                    LabeledContent("版本", value: "1.6.1")
                 }
             }
             .navigationTitle("设置")

@@ -6,6 +6,7 @@ import NIOCore
 /// SFTP 客户端（Citadel 0.12.x）
 /// SSH/SFTP 会话在客户端生命周期内复用，操作经 SerialExecutor 串行。
 /// 支持：密码登录、OpenSSH 格式私钥（ed25519 / RSA）。
+/// 上传按块写；遇断线自动 tearDown + 重连重试，减轻 N1/Dropbear 半死连接问题。
 final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     private let server: StorageServer
     private let credentials: ServerCredentials
@@ -14,6 +15,10 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     private var ssh: SSHClient?
     private var sftp: SFTPClient?
     private var ensuredDirs = Set<String>()
+
+    /// 分块大小：过大占内存且进度粗；过小 SFTP 往返多。256KB 对 N1 局域网较均衡。
+    private let chunkSize = 256 * 1024
+    private let maxOpRetries = 3
 
     init(server: StorageServer, credentials: ServerCredentials) {
         self.server = server
@@ -44,39 +49,52 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     }
 
     func remoteExists(relativePath: String) async throws -> Bool {
-        try await gate.run { [self] in
-            let path = normalized(server.joinedRemotePath(relativePath))
-            let sftp = try await ensureSFTP()
-            do {
-                _ = try await sftp.getAttributes(at: path)
-                return true
-            } catch {
-                return false
+        try await withConnectionRetry {
+            try await self.gate.run { [self] in
+                let path = normalized(server.joinedRemotePath(relativePath))
+                let sftp = try await ensureSFTP()
+                do {
+                    _ = try await sftp.getAttributes(at: path)
+                    return true
+                } catch {
+                    // 属性查询失败多数是「不存在」；若像断连则向上抛出以便重连
+                    if Self.looksLikeConnectionError(error) {
+                        await tearDown()
+                        throw StorageError.connectionFailed(friendly(error))
+                    }
+                    return false
+                }
             }
         }
     }
 
     func ensureDirectories(relativeDir: String) async throws {
-        try await gate.run { [self] in
-            let full = normalized(server.joinedRemotePath(relativeDir))
-            if ensuredDirs.contains(full) { return }
+        try await withConnectionRetry {
+            try await self.gate.run { [self] in
+                let full = normalized(server.joinedRemotePath(relativeDir))
+                if ensuredDirs.contains(full) { return }
 
-            let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-            guard !parts.isEmpty else { return }
+                let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+                guard !parts.isEmpty else { return }
 
-            let sftp = try await ensureSFTP()
-            var built = ""
-            for part in parts {
-                built += "/" + part
-                if ensuredDirs.contains(built) { continue }
-                do {
-                    try await sftp.createDirectory(atPath: built)
-                } catch {
-                    // 已存在
+                let sftp = try await ensureSFTP()
+                var built = ""
+                for part in parts {
+                    built += "/" + part
+                    if ensuredDirs.contains(built) { continue }
+                    do {
+                        try await sftp.createDirectory(atPath: built)
+                    } catch {
+                        if Self.looksLikeConnectionError(error) {
+                            await tearDown()
+                            throw StorageError.connectionFailed(friendly(error))
+                        }
+                        // 已存在等
+                    }
+                    ensuredDirs.insert(built)
                 }
-                ensuredDirs.insert(built)
+                ensuredDirs.insert(full)
             }
-            ensuredDirs.insert(full)
         }
     }
 
@@ -92,30 +110,76 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
         }
 
         let path = normalized(server.joinedRemotePath(relativePath))
+        let attrs = try FileManager.default.attributesOfItem(atPath: localURL.path)
+        let totalBytes = (attrs[.size] as? NSNumber)?.intValue ?? 0
         let fileData = try Data(contentsOf: localURL, options: [.mappedIfSafe])
-        progress?(0.05)
+        let size = totalBytes > 0 ? totalBytes : fileData.count
+        progress?(0.01)
 
-        try await gate.run { [self] in
-            do {
-                let sftp = try await ensureSFTP()
-                // write + create + truncate：覆盖已有文件
-                try await sftp.withFile(
-                    filePath: path,
-                    flags: [.write, .create, .truncate]
-                ) { file in
-                    var buffer = ByteBufferAllocator().buffer(capacity: fileData.count)
-                    buffer.writeBytes(fileData)
-                    try await file.write(buffer)
+        try await withConnectionRetry {
+            try await self.gate.run { [self] in
+                do {
+                    let sftp = try await ensureSFTP()
+                    try await sftp.withFile(
+                        filePath: path,
+                        flags: [.write, .create, .truncate]
+                    ) { file in
+                        if size == 0 {
+                            progress?(1)
+                            return
+                        }
+                        var offset = 0
+                        while offset < fileData.count {
+                            let end = min(offset + chunkSize, fileData.count)
+                            let slice = fileData[offset..<end]
+                            var buffer = ByteBufferAllocator().buffer(capacity: slice.count)
+                            buffer.writeBytes(slice)
+                            try await file.write(buffer)
+                            offset = end
+                            let p = Double(offset) / Double(max(fileData.count, 1))
+                            progress?(min(max(p, 0.01), 0.99))
+                        }
+                    }
+                    progress?(1)
+                } catch let e as StorageError {
+                    await tearDown()
+                    throw e
+                } catch {
+                    await tearDown()
+                    if Self.looksLikeConnectionError(error) {
+                        throw StorageError.connectionFailed(friendly(error))
+                    }
+                    throw StorageError.remote(friendly(error))
                 }
-                progress?(1)
-            } catch let e as StorageError {
-                await tearDown()
-                throw e
-            } catch {
-                await tearDown()
-                throw StorageError.remote(friendly(error))
             }
         }
+    }
+
+    // MARK: - Retry / connection
+
+    /// 对「像断线」的错误：tearDown 后重试整个操作（最多 maxOpRetries 次）
+    private func withConnectionRetry<T: Sendable>(
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        var lastError: Error?
+        for attempt in 0..<maxOpRetries {
+            do {
+                return try await body()
+            } catch {
+                lastError = error
+                let retryable = Self.looksLikeConnectionError(error)
+                    || {
+                        if case StorageError.connectionFailed = error { return true }
+                        return false
+                    }()
+                guard retryable, attempt + 1 < maxOpRetries else { throw error }
+                await gate.run { [self] in await tearDown() }
+                // 退避：0.4s / 0.9s
+                let ns = UInt64(400_000_000 + attempt * 500_000_000)
+                try? await Task.sleep(nanoseconds: ns)
+            }
+        }
+        throw lastError ?? StorageError.remote("未知错误")
     }
 
     // MARK: - Connection
@@ -254,6 +318,42 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
         return p
     }
 
+    /// 判断是否像传输层/会话断开（可重连）
+    fileprivate static func looksLikeConnectionError(_ error: Error) -> Bool {
+        if case StorageError.connectionFailed = error { return true }
+        let ns = error as NSError
+        let msg = error.localizedDescription
+        let detail = String(describing: error)
+        let blob = "\(msg) \(detail) \(ns.domain) \(ns.localizedFailureReason ?? "") \(ns.code)"
+            .lowercased()
+
+        if blob.contains("nio core") || blob.contains("niocore") || blob.contains("ioerror") {
+            return true
+        }
+        if blob.contains("niossh") { return true }
+        if blob.contains("connection reset")
+            || blob.contains("broken pipe")
+            || blob.contains("socket")
+            || blob.contains("not connected")
+            || blob.contains("connection refused")
+            || blob.contains("timed out")
+            || blob.contains("timeout")
+            || blob.contains("eof")
+            || blob.contains("channel")
+            || blob.contains("closed")
+            || blob.contains("reset by peer")
+            || blob.contains("network is unreachable")
+            || blob.contains("no route to host") {
+            return true
+        }
+        // POSIX ECONNRESET / EPIPE / ETIMEDOUT 等
+        if ns.domain == NSPOSIXErrorDomain {
+            let c = ns.code
+            if [32, 54, 57, 60, 61, 64].contains(c) { return true }
+        }
+        return false
+    }
+
     private func friendly(_ error: Error) -> String {
         let ns = error as NSError
         let msg = error.localizedDescription
@@ -284,6 +384,14 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
             || blob.contains("no route to host")
             || (blob.contains("socket") && blob.contains("not connected")) {
             return "无法连到主机：检查 IP、端口（默认 22）、SSH 是否开启，以及是否在同一局域网"
+        }
+        // 半死连接 / 并发压垮 Dropbear 常见：NIOCore.IOError 错误 1
+        if blob.contains("niocore")
+            || blob.contains("nio core")
+            || blob.contains("ioerror")
+            || blob.contains("io error")
+            || (blob.contains("未能完成操作") && blob.contains("错误")) {
+            return "连接中断（\(detail)）。常见原因：并发过高压垮 N1 SSH、Wi‑Fi 不稳、会话超时。可在设置把并发降到 2，并重试失败项"
         }
         // iOS 常把 NIOSSHError 显示成「错误 1」，给出可操作提示
         if blob.contains("niossh") || ns.domain.localizedCaseInsensitiveContains("niossh") {

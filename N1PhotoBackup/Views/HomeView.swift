@@ -193,7 +193,7 @@ struct HomeView: View {
                 .font(.headline)
             tipRow("设置里添加 SFTP：主机、端口 22、用户密码、/mnt/... 路径")
             tipRow("可保存多台 SFTP，主页可切换当前目标")
-            tipRow("设置里可调并发路数（默认 4 路独立连接）")
+            tipRow("设置里可调并发（默认 3 路；不稳请降到 2）")
             tipRow("上传中默认保持屏幕常亮，避免休眠中断")
             tipRow("大量备份请插电并保持 App 前台")
         }
