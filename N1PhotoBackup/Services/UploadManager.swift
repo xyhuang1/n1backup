@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import Combine
+import UIKit
 
 @MainActor
 final class UploadManager: ObservableObject {
@@ -13,12 +14,50 @@ final class UploadManager: ObservableObject {
     @Published private(set) var finishedCount: Int = 0
     @Published private(set) var totalCount: Int = 0
 
+    /// 并发上传路数（每路独立 SFTP 连接）。1–8，默认 4。
+    @Published var maxConcurrentUploads: Int {
+        didSet {
+            let clamped = Self.clampConcurrency(maxConcurrentUploads)
+            if clamped != maxConcurrentUploads {
+                maxConcurrentUploads = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: Self.concurrencyKey)
+        }
+    }
+
+    /// 备份运行时保持屏幕常亮（默认开）
+    @Published var keepScreenOn: Bool {
+        didSet {
+            UserDefaults.standard.set(keepScreenOn, forKey: Self.keepScreenKey)
+            applyIdleTimerPolicy()
+        }
+    }
+
     private var task: Task<Void, Never>?
-    /// SFTP 客户端内部串行；此处 2 路用于导出+上传流水线
-    private let maxConcurrent = 2
     /// 进度 UI 节流：避免每个 TCP 分片都触发 SwiftUI 刷新
     private var lastProgressAt: [String: CFAbsoluteTime] = [:]
     private let progressMinInterval: CFAbsoluteTime = 0.2
+
+    private static let concurrencyKey = "upload_max_concurrent_v1"
+    private static let keepScreenKey = "upload_keep_screen_on_v1"
+    static let minConcurrency = 1
+    static let maxConcurrency = 8
+    static let defaultConcurrency = 4
+
+    private init() {
+        let saved = UserDefaults.standard.object(forKey: Self.concurrencyKey) as? Int
+        maxConcurrentUploads = Self.clampConcurrency(saved ?? Self.defaultConcurrency)
+        if UserDefaults.standard.object(forKey: Self.keepScreenKey) == nil {
+            keepScreenOn = true
+        } else {
+            keepScreenOn = UserDefaults.standard.bool(forKey: Self.keepScreenKey)
+        }
+    }
+
+    static func clampConcurrency(_ value: Int) -> Int {
+        min(max(value, minConcurrency), maxConcurrency)
+    }
 
     var progressText: String {
         guard totalCount > 0 else { return "空闲" }
@@ -105,6 +144,7 @@ final class UploadManager: ObservableObject {
         lastProgressAt.removeAll()
         totalCount = 0
         finishedCount = 0
+        applyIdleTimerPolicy()
     }
 
     func retryFailed() {
@@ -117,12 +157,21 @@ final class UploadManager: ObservableObject {
         startIfNeeded()
     }
 
+    // MARK: - Idle timer (screen awake)
+
+    private func applyIdleTimerPolicy() {
+        // 仅在「上传中且开启常亮」时禁用休眠
+        let shouldKeepOn = isRunning && keepScreenOn
+        UIApplication.shared.isIdleTimerDisabled = shouldKeepOn
+    }
+
     // MARK: - Worker
 
     private func startIfNeeded() {
         guard task == nil else { return }
         isRunning = true
         lastError = nil
+        applyIdleTimerPolicy()
         task = Task { [weak self] in
             await self?.runLoop()
         }
@@ -132,6 +181,7 @@ final class UploadManager: ObservableObject {
         defer {
             isRunning = false
             task = nil
+            applyIdleTimerPolicy()
         }
 
         guard let server = ServerStore.shared.selectedServer else {
@@ -139,10 +189,15 @@ final class UploadManager: ObservableObject {
             return
         }
         let credentials = ServerStore.shared.credentials(for: server)
+        let concurrency = Self.clampConcurrency(maxConcurrentUploads)
 
-        let client: StorageClient
+        // 每路并发使用独立 SFTP 连接：单连接内仍串行，多连接才能真正提速
+        var clients: [StorageClient] = []
+        clients.reserveCapacity(concurrency)
         do {
-            client = try StorageClientFactory.make(server: server, credentials: credentials)
+            for _ in 0..<concurrency {
+                clients.append(try StorageClientFactory.make(server: server, credentials: credentials))
+            }
         } catch {
             let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             lastError = msg
@@ -153,17 +208,17 @@ final class UploadManager: ObservableObject {
             return
         }
 
-        // 整轮备份复用同一连接；结束时关闭
         await withTaskCancellationHandler {
             let skip = skipExisting
             while !Task.isCancelled {
                 let pending = items.filter { $0.status == .pending }
                 if pending.isEmpty { break }
 
-                let batch = Array(pending.prefix(maxConcurrent))
+                let batch = Array(pending.prefix(clients.count))
                 await withTaskGroup(of: Void.self) { group in
-                    for item in batch {
+                    for (index, item) in batch.enumerated() {
                         let snapshot = item
+                        let client = clients[index]
                         group.addTask { [weak self] in
                             await self?.process(
                                 snapshot,
@@ -178,9 +233,16 @@ final class UploadManager: ObservableObject {
             }
         } onCancel: {
             // 取消时尽快释放连接（close 幂等）
-            Task { await client.close() }
+            Task {
+                for c in clients {
+                    await c.close()
+                }
+            }
         }
-        await client.close()
+
+        for c in clients {
+            await c.close()
+        }
     }
 
     private nonisolated func process(

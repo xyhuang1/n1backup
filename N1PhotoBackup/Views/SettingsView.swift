@@ -42,8 +42,32 @@ struct SettingsView: View {
                     Text("本版本仅支持 SFTP（SSH）。在 N1 上开启 SSH，填 IP、用户、密码与备份目录即可。")
                 }
 
-                Section("上传选项") {
+                Section {
                     Toggle("跳过远端已存在的文件", isOn: $uploadManager.skipExisting)
+                    Toggle("备份时保持屏幕常亮", isOn: $uploadManager.keepScreenOn)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("并发上传")
+                            Spacer()
+                            Text("\(uploadManager.maxConcurrentUploads) 路")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { Double(uploadManager.maxConcurrentUploads) },
+                                set: { uploadManager.maxConcurrentUploads = Int($0.rounded()) }
+                            ),
+                            in: Double(UploadManager.minConcurrency)...Double(UploadManager.maxConcurrency),
+                            step: 1
+                        )
+                    }
+                    .padding(.vertical, 4)
+                } header: {
+                    Text("上传选项")
+                } footer: {
+                    Text("每路使用独立 SFTP 连接。路数越高速度通常越快，但更占带宽与 N1 CPU；Wi‑Fi 较弱时可降到 2。常亮仅在上传进行中生效。")
                 }
 
                 Section("N1 / iStoreOS") {
@@ -58,7 +82,7 @@ struct SettingsView: View {
                 Section("关于") {
                     LabeledContent("应用", value: "N1 相册备份")
                     LabeledContent("协议", value: "SFTP only")
-                    LabeledContent("版本", value: "1.5.0")
+                    LabeledContent("版本", value: "1.6.0")
                 }
             }
             .navigationTitle("设置")
