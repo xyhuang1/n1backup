@@ -1,9 +1,8 @@
-# XcodeGen — SMB(AMSMB2 静态) / SFTP(Citadel 静态) 已内置
+# XcodeGen — 仅 SFTP（Citadel 静态库）
 # 生成: xcodegen generate
 #
-# 关键：AMSMB2 上游默认 type: .dynamic，未签名 IPA 重签后常因
-# @rpath/AMSMB2.framework 缺失而安装失败或秒退。
-# 本仓库用 ThirdParty/AMSMB2 本地包，强制静态链接进主二进制，与 Citadel 一致。
+# Citadel + NIO/Crypto 均为静态链接，链进主二进制，无需 embed framework。
+# 未签名 IPA 重签后即可安装（与第一版结构一致，仅多一个静态 SPM 依赖）。
 
 name: N1PhotoBackup
 
@@ -15,9 +14,6 @@ options:
   groupSortPosition: top
 
 packages:
-  # 本地 vendored 静态库（勿改回 remote dynamic）
-  AMSMB2:
-    path: ThirdParty/AMSMB2
   Citadel:
     url: https://github.com/orlandos-nl/Citadel
     exactVersion: 0.12.1
@@ -27,8 +23,8 @@ settings:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1,2"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    CURRENT_PROJECT_VERSION: "5"
-    MARKETING_VERSION: "1.4.0"
+    CURRENT_PROJECT_VERSION: "6"
+    MARKETING_VERSION: "1.5.0"
     CODE_SIGN_STYLE: Manual
     ENABLE_USER_SCRIPT_SANDBOXING: false
     CLANG_ENABLE_MODULES: YES
@@ -47,9 +43,6 @@ targets:
         excludes:
           - "**/.DS_Store"
     dependencies:
-      # 静态：不要 embed（embed 动态 framework 才需要）
-      - package: AMSMB2
-        product: AMSMB2
       - package: Citadel
         product: Citadel
     settings:

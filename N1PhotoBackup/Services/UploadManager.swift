@@ -14,7 +14,7 @@ final class UploadManager: ObservableObject {
     @Published private(set) var totalCount: Int = 0
 
     private var task: Task<Void, Never>?
-    /// WebDAV 可并行；SMB/SFTP 在客户端内部串行，这里仍允许 2 路导出+上传流水线
+    /// SFTP 客户端内部串行；此处 2 路用于导出+上传流水线
     private let maxConcurrent = 2
     /// 进度 UI 节流：避免每个 TCP 分片都触发 SwiftUI 刷新
     private var lastProgressAt: [String: CFAbsoluteTime] = [:]

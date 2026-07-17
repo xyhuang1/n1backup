@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-/// 多服务器配置仓库 + 当前选中项
+/// 多台 SFTP 服务器 + 当前选中项
 @MainActor
 final class ServerStore: ObservableObject {
     static let shared = ServerStore()
@@ -27,8 +27,7 @@ final class ServerStore: ObservableObject {
            let list = try? JSONDecoder().decode([StorageServer].self, from: data) {
             servers = list.sorted { $0.updatedAt > $1.updatedAt }
         } else {
-            // 兼容旧版单服务器配置
-            servers = migrateFromV1()
+            servers = []
         }
         if let raw = defaults.string(forKey: selectedKey), let id = UUID(uuidString: raw) {
             selectedServerId = id
@@ -82,41 +81,4 @@ final class ServerStore: ObservableObject {
     func credentials(for server: StorageServer) -> ServerCredentials {
         credentials(for: server.id)
     }
-
-    // MARK: - 旧版迁移
-
-    private func migrateFromV1() -> [StorageServer] {
-        let key = "server_config_v1"
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let old = try? JSONDecoder().decode(LegacyServerConfig.self, from: data) else {
-            return []
-        }
-        var s = StorageServer.blank(protocol: .webdav)
-        s.name = "N1 WebDAV"
-        s.host = old.host
-        s.port = old.port
-        s.useTLS = old.useHTTPS
-        s.allowInsecureTLS = old.allowInsecureTLS
-        s.username = old.username
-        s.basePath = old.basePath
-        s.folderLayout = old.folderLayout == "flat" ? .flat : .yearMonth
-        let pwd = KeychainStore.read(account: "n1_webdav_password") ?? ""
-        KeychainStore.saveCredentials(
-            serverId: s.id,
-            credentials: ServerCredentials(password: pwd, privateKey: "", passphrase: "")
-        )
-        UserDefaults.standard.removeObject(forKey: key)
-        return [s]
-    }
-}
-
-/// 仅用于迁移
-private struct LegacyServerConfig: Codable {
-    var host: String
-    var port: Int
-    var useHTTPS: Bool
-    var username: String
-    var basePath: String
-    var allowInsecureTLS: Bool
-    var folderLayout: String
 }

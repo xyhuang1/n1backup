@@ -14,7 +14,7 @@ enum StorageError: LocalizedError {
         case .invalidConfiguration(let m): return "配置无效：\(m)"
         case .notAvailable(let m): return m
         case .connectionFailed(let m): return "连接失败：\(m)"
-        case .authFailed: return "认证失败，请检查用户名/密码"
+        case .authFailed: return "认证失败，请检查用户名/密码或私钥"
         case .httpStatus(let c, let b):
             if let b, !b.isEmpty { return "HTTP \(c)：\(b.prefix(120))" }
             return "HTTP \(c)"
@@ -24,7 +24,7 @@ enum StorageError: LocalizedError {
     }
 }
 
-/// 统一存储上传接口
+/// 统一存储上传接口（本应用仅 SFTP 实现）
 protocol StorageClient: AnyObject {
     func testConnection() async throws
     func remoteExists(relativePath: String) async throws -> Bool
@@ -35,7 +35,6 @@ protocol StorageClient: AnyObject {
         contentType: String?,
         progress: ((Double) -> Void)?
     ) async throws
-    /// 释放长连接（默认空实现）
     func close() async
 }
 
@@ -43,7 +42,7 @@ extension StorageClient {
     func close() async {}
 }
 
-/// 串行化异步操作，避免 SMB/SFTP 连接并发写冲突
+/// 串行化异步操作，避免 SFTP 连接并发写冲突
 actor SerialExecutor {
     func run<T: Sendable>(_ work: @Sendable () async throws -> T) async rethrows -> T {
         try await work()
@@ -56,15 +55,6 @@ enum StorageClientFactory {
         guard !host.isEmpty else {
             throw StorageError.invalidConfiguration("主机地址不能为空")
         }
-        switch server.protocolKind {
-        case .webdav:
-            return WebDAVStorageClient(server: server, credentials: credentials)
-        case .smb:
-            return SMBStorageClient(server: server, credentials: credentials)
-        case .sftp:
-            return SFTPStorageClient(server: server, credentials: credentials)
-        case .ftp:
-            return FTPStorageClient(server: server, credentials: credentials)
-        }
+        return SFTPStorageClient(server: server, credentials: credentials)
     }
 }

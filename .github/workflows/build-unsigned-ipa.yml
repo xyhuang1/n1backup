@@ -1,9 +1,5 @@
-# 构建「未签名 IPA」—— 给你自己用 牛蛙助手 / 超级签名 / 爱思 等重签
-# 不需要上传任何苹果证书到 GitHub
-#
-# 使用：Actions → Build Unsigned IPA → Run workflow → 下载 Artifact
-#
-# v1.4：AMSMB2 改为本地静态包，IPA 内不再依赖 @rpath/AMSMB2.framework
+# 构建「未签名 IPA」—— 牛蛙助手 / 超级签名重签
+# 仅 SFTP（Citadel 静态），无动态 framework，重签后可正常安装
 
 name: Build Unsigned IPA
 
@@ -13,7 +9,6 @@ on:
     branches: [main, master]
     paths:
       - "N1PhotoBackup/**"
-      - "ThirdParty/**"
       - "project.yml"
       - "Info.plist"
       - ".github/workflows/build-unsigned-ipa.yml"
@@ -51,7 +46,6 @@ jobs:
             fi
           done
           xcodebuild -version
-          swift --version
 
       - name: Install XcodeGen
         run: |
@@ -64,14 +58,11 @@ jobs:
 
       - name: Generate project
         run: |
-          test -f ThirdParty/AMSMB2/Package.swift
-          grep -q 'type: .static' ThirdParty/AMSMB2/Package.swift
           xcodegen generate
           test -d N1PhotoBackup.xcodeproj
-          echo "=== packages ==="
-          grep -A3 -E 'AMSMB2|Citadel|path:|exactVersion' project.yml || true
+          grep -A2 Citadel project.yml || true
 
-      - name: Resolve Swift packages
+      - name: Resolve Swift packages (Citadel)
         run: |
           set -euo pipefail
           mkdir -p build
@@ -81,15 +72,11 @@ jobs:
             -clonedSourcePackagesDirPath build/SourcePackages \
             2>&1 | tee build/resolve.log
           echo "✓ Packages resolved"
-          ls build/SourcePackages/checkouts 2>/dev/null || true
 
       - name: Build (no code sign)
         run: |
           set -euo pipefail
           mkdir -p build
-
-          # 关闭签名，仅编译 arm64 真机包（牛蛙等工具会再签）
-          # AMSMB2 静态 + Citadel 静态 → 主二进制自包含，无外部 @rpath framework
           set -o pipefail
           if ! xcodebuild build \
             -project N1PhotoBackup.xcodeproj \
@@ -109,10 +96,8 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             2>&1 | tee build/build.log
           then
-            echo ""
             echo "========== COMPILER ERRORS =========="
             grep -E "error:|fatal error:" build/build.log | head -80 || true
-            echo "========== END ERRORS =========="
             exit 65
           fi
 
@@ -122,7 +107,7 @@ jobs:
 
           APP_PATH=$(find build/DerivedData -type d -name "${APP_NAME}.app" | head -n1)
           if [ -z "$APP_PATH" ]; then
-            echo "找不到 ${APP_NAME}.app，目录如下："
+            echo "找不到 ${APP_NAME}.app"
             find build/DerivedData -name "*.app" 2>/dev/null || true
             exit 1
           fi
@@ -130,96 +115,50 @@ jobs:
           ls -la "$APP_PATH"
 
           BIN="$APP_PATH/${APP_NAME}"
-          FRAMEWORKS_DIR="$APP_PATH/Frameworks"
-          mkdir -p "$FRAMEWORKS_DIR"
 
-          # 若仍有动态 SPM framework（不应有 AMSMB2），尽量嵌入兜底
-          while IFS= read -r fw; do
-            name=$(basename "$fw")
-            if [ ! -d "$FRAMEWORKS_DIR/$name" ]; then
-              echo "Embedding $fw"
-              cp -R "$fw" "$FRAMEWORKS_DIR/"
-            fi
-          done < <(find build/DerivedData -type d -name "*.framework" \
-            \( -path "*/PackageFrameworks/*" -o -path "*/Build/Products/*" \) 2>/dev/null \
-            | grep -v "${APP_NAME}.app" || true)
-
-          # 去掉签名痕迹，方便重签
+          # 去掉签名痕迹
           find "$APP_PATH" \( -name "_CodeSignature" -o -name "CodeResources" \) -prune -exec rm -rf {} + 2>/dev/null || true
-          find "$FRAMEWORKS_DIR" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
-          # 空 Frameworks 目录也删掉，避免重签工具困惑
-          if [ -d "$FRAMEWORKS_DIR" ] && [ -z "$(ls -A "$FRAMEWORKS_DIR" 2>/dev/null)" ]; then
-            rmdir "$FRAMEWORKS_DIR" || true
-          fi
-
-          echo "=== App layout (depth 2) ==="
-          find "$APP_PATH" -maxdepth 2 \( -type d -o -type f \) | head -80
-          ls -la "$FRAMEWORKS_DIR" 2>/dev/null || echo "(no Frameworks dir — OK for fully static)"
 
           if command -v otool >/dev/null 2>&1; then
-            echo "=== otool -L (app dylibs) ==="
-            otool -L "$BIN" | head -60
-
-            # 硬性：不得再依赖 @rpath/AMSMB2.framework
-            if otool -L "$BIN" | grep -E '@rpath/AMSMB2\.framework' >/dev/null; then
-              echo "❌ 主二进制仍动态链接 AMSMB2.framework — 静态链接失败，拒绝打包"
-              exit 1
-            fi
-
-            missing=0
-            while read -r line; do
-              fw=$(echo "$line" | sed -n 's/.*@rpath\/\([^/]*\.framework\).*/\1/p')
-              if [ -n "$fw" ]; then
-                if [ ! -d "$FRAMEWORKS_DIR/$fw" ]; then
-                  echo "❌ 缺少嵌入框架: $fw （来自: $line）"
+            echo "=== otool -L ==="
+            otool -L "$BIN" | head -40
+            # 不得出现第三方 @rpath/*.framework（Citadel 应为静态）
+            if otool -L "$BIN" | grep -E '@rpath/.*\.framework' | grep -v '/System/' >/dev/null; then
+              echo "❌ 仍存在 @rpath framework 依赖，重签后可能装不上："
+              otool -L "$BIN" | grep '@rpath'
+              # 尝试嵌入兜底
+              FRAMEWORKS_DIR="$APP_PATH/Frameworks"
+              mkdir -p "$FRAMEWORKS_DIR"
+              while IFS= read -r fw; do
+                name=$(basename "$fw")
+                [ -d "$FRAMEWORKS_DIR/$name" ] || cp -R "$fw" "$FRAMEWORKS_DIR/"
+              done < <(find build/DerivedData -type d -name "*.framework" \
+                \( -path "*/PackageFrameworks/*" -o -path "*/Build/Products/*" \) 2>/dev/null \
+                | grep -v "${APP_NAME}.app" || true)
+              missing=0
+              while read -r line; do
+                fw=$(echo "$line" | sed -n 's/.*@rpath\/\([^/]*\.framework\).*/\1/p')
+                if [ -n "$fw" ] && [ ! -d "$FRAMEWORKS_DIR/$fw" ]; then
+                  echo "仍缺: $fw"
                   missing=1
-                else
-                  echo "✓ embedded $fw"
                 fi
+              done < <(otool -L "$BIN" | awk '{print $1}')
+              if [ "$missing" -ne 0 ]; then
+                exit 1
               fi
-            done < <(otool -L "$BIN" | awk '{print $1}')
-
-            if [ "$missing" -ne 0 ]; then
-              echo "Frameworks 不完整，拒绝打包"
-              find build/DerivedData -type d -name "*.framework" | head -50
-              exit 1
+            else
+              echo "✓ 无第三方 @rpath framework（静态链接）"
             fi
-
-            # 只允许系统路径的 dylib；@rpath 必须有对应 framework
-            echo "=== non-system load commands ==="
-            otool -L "$BIN" | awk 'NR>1 {print $1}' | while read -r p; do
-              case "$p" in
-                /usr/lib/*|/System/*) ;;
-                @rpath/*)
-                  echo "rpath dep: $p"
-                  ;;
-                @executable_path/*)
-                  echo "exec dep: $p"
-                  ;;
-                *)
-                  echo "other dep: $p"
-                  ;;
-              esac
-            done
-
-            echo "✓ 无 AMSMB2.framework 动态依赖（静态进主二进制）"
           fi
 
-          # 标准 IPA
           rm -rf build/Payload
           mkdir -p build/Payload
           cp -R "$APP_PATH" build/Payload/
-
           cd build
           rm -f "${APP_NAME}-unsigned.ipa"
           zip -ry "${APP_NAME}-unsigned.ipa" Payload
           ls -lh "${APP_NAME}-unsigned.ipa"
-
           ditto -c -k --sequesterRsrc --keepParent Payload/"${APP_NAME}.app" "${APP_NAME}.app.zip"
-          ls -lh "${APP_NAME}.app.zip"
-
-          echo "=== Payload frameworks ==="
-          ls -la Payload/"${APP_NAME}.app/Frameworks" 2>/dev/null || echo "(none)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -235,14 +174,11 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### 未签名 IPA 已生成（v1.4.0 · AMSMB2 静态链接）"
+            echo "### 未签名 IPA（v1.5.0 · 仅 SFTP）"
             echo ""
-            echo "1. 下载 Artifact **N1PhotoBackup-unsigned-ipa**"
+            echo "1. 下载 **N1PhotoBackup-unsigned-ipa**"
             echo "2. 解压得到 \`N1PhotoBackup-unsigned.ipa\`"
-            echo "3. 用 **牛蛙助手** 导入证书 → 签名 → 安装"
-            echo "4. Bundle ID 默认：\`${BUNDLE_ID}\`（签名时可改）"
-            echo "5. 最低系统：**iOS 17**"
-            echo "6. 依赖：AMSMB2 **静态**（本地 ThirdParty）+ Citadel 0.12.1 **静态**"
-            echo ""
-            echo "> 本版 IPA 不再包含 AMSMB2.framework，重签不必再勾「嵌入依赖」。"
+            echo "3. 牛蛙助手导入证书签名安装"
+            echo "4. Bundle ID：\`${BUNDLE_ID}\`"
+            echo "5. iOS **17+**；协议：**仅 SFTP**（Citadel 静态）"
           } >> "$GITHUB_STEP_SUMMARY"

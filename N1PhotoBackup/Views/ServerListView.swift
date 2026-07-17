@@ -4,16 +4,15 @@ struct ServerListView: View {
     @EnvironmentObject private var serverStore: ServerStore
     @State private var editing: StorageServer?
     @State private var isCreating = false
-    @State private var createProtocol: StorageProtocolKind = .webdav
 
     var body: some View {
         List {
             if serverStore.servers.isEmpty {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("还没有存储服务器")
+                        Text("还没有 SFTP 服务器")
                             .font(.headline)
-                        Text("点右上角「+」，选择 WebDAV / SMB / SFTP / FTP，填写授权信息后保存。")
+                        Text("点右上角「+」，填写主机、端口、账号密码与备份路径后保存。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -44,14 +43,6 @@ struct ServerListView: View {
                             }
                             .tint(.blue)
                         }
-                        .swipeActions(edge: .leading) {
-                            Button {
-                                serverStore.select(server.id)
-                            } label: {
-                                Label("选用", systemImage: "checkmark")
-                            }
-                            .tint(.green)
-                        }
                         .contextMenu {
                             Button("设为当前备份目标") {
                                 serverStore.select(server.id)
@@ -63,50 +54,27 @@ struct ServerListView: View {
                         }
                     }
                 } header: {
-                    Text("已保存的连接")
+                    Text("已保存的 SFTP")
                 } footer: {
-                    Text("点按设为当前目标；左滑编辑/删除。备份使用带绿色 ✓ 的那一条。")
+                    Text("点按设为当前目标；备份使用带绿色 ✓ 的那一条。")
                 }
             }
 
-            Section("添加新连接") {
-                ForEach(StorageProtocolKind.allCases) { kind in
-                    Button {
-                        createProtocol = kind
-                        isCreating = true
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: kind.systemImage)
-                                .font(.title3)
-                                .frame(width: 28)
-                                .foregroundStyle(.blue)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(kind.title)
-                                    .foregroundStyle(.primary)
-                                Text(kind.subtitle)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "plus.circle.fill")
-                                .foregroundStyle(.blue)
-                        }
-                    }
+            Section {
+                Button {
+                    isCreating = true
+                } label: {
+                    Label("添加 SFTP 服务器", systemImage: "plus.circle.fill")
                 }
+            } footer: {
+            Text("仅支持 SFTP。N1 上开启 SSH，并保证用户对 USB 目录可写。")
             }
         }
-        .navigationTitle("服务器")
+        .navigationTitle("SFTP 服务器")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    ForEach(StorageProtocolKind.allCases) { kind in
-                        Button {
-                            createProtocol = kind
-                            isCreating = true
-                        } label: {
-                            Label(kind.title, systemImage: kind.systemImage)
-                        }
-                    }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isCreating = true
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -115,22 +83,20 @@ struct ServerListView: View {
         .sheet(isPresented: $isCreating) {
             NavigationStack {
                 ServerEditView(
-                    server: StorageServer.blank(protocol: createProtocol),
+                    server: StorageServer.blank(),
                     credentials: .empty,
                     isNew: true
                 )
             }
-            .environmentObject(serverStore)
         }
         .sheet(item: $editing) { server in
             NavigationStack {
                 ServerEditView(
                     server: server,
-                    credentials: serverStore.credentials(for: server),
+                    credentials: serverStore.credentials(for: server.id),
                     isNew: false
                 )
             }
-            .environmentObject(serverStore)
         }
     }
 }
@@ -142,33 +108,23 @@ private struct ServerRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: server.protocolKind.systemImage)
-                .font(.title2)
+                .font(.title3)
                 .foregroundStyle(.blue)
-                .frame(width: 36)
-
+                .frame(width: 28)
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(server.displayTitle)
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                            .font(.subheadline)
-                    }
-                }
+                Text(server.displayTitle)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
                 Text(server.summaryLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
-
-            Spacer(minLength: 0)
-
-            Image(systemName: "chevron.left.circle")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .accessibilityLabel("左滑编辑")
+            Spacer()
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
         }
         .padding(.vertical, 4)
     }

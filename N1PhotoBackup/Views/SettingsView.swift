@@ -12,12 +12,12 @@ struct SettingsView: View {
                         ServerListView()
                     } label: {
                         HStack(spacing: 12) {
-                            Image(systemName: "server.rack")
+                            Image(systemName: "terminal")
                                 .font(.title2)
                                 .foregroundStyle(.blue)
                                 .frame(width: 36)
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("存储服务器")
+                                Text("SFTP 服务器")
                                     .font(.body.weight(.semibold))
                                 if let s = serverStore.selectedServer {
                                     Text("当前：\(s.displayTitle)")
@@ -39,7 +39,7 @@ struct SettingsView: View {
                 } header: {
                     Text("连接")
                 } footer: {
-                    Text("支持 WebDAV / SMB / SFTP / FTP。新建时选择协议并填写对应授权信息。")
+                    Text("本版本仅支持 SFTP（SSH）。在 N1 上开启 SSH，填 IP、用户、密码与备份目录即可。")
                 }
 
                 Section("上传选项") {
@@ -48,18 +48,17 @@ struct SettingsView: View {
 
                 Section("N1 / iStoreOS") {
                     VStack(alignment: .leading, spacing: 8) {
-                        tip("USB 在 DiskMan 挂载后，用 Samba / Alist / SSH / FTP 任一暴露")
-                        tip("WebDAV：Docker Alist 或 bytemark/webdav")
-                        tip("SMB：Luci 开启 Samba，填共享名即可（已内置）")
-                        tip("SFTP：系统 SSH，填用户密码与 /mnt/... 路径即可（已内置）")
+                        tip("USB 挂载后：mkdir -p /mnt/sda1/PhoneBackup")
+                        tip("系统 SSH 保持开启；手机与 N1 同一 Wi‑Fi")
+                        tip("确认登录用户对该目录有写权限")
                     }
                     .padding(.vertical, 4)
                 }
 
                 Section("关于") {
                     LabeledContent("应用", value: "N1 相册备份")
-                    LabeledContent("协议", value: "WebDAV · SMB · SFTP · FTP")
-                    LabeledContent("版本", value: "1.2.0")
+                    LabeledContent("协议", value: "SFTP only")
+                    LabeledContent("版本", value: "1.5.0")
                 }
             }
             .navigationTitle("设置")
