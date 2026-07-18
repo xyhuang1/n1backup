@@ -317,14 +317,8 @@ final class UploadManager: ObservableObject {
         let itemId = item.id
 
         do {
-            if skipExisting {
-                await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .checking) }
-                if try await client.remoteExists(relativePath: item.remoteRelativePath) {
-                    await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
-                    return
-                }
-            }
-
+            // 先导出再决定是否跳过：需要本地真实字节数与远端比对
+            // （旧逻辑只看路径是否存在，会把 256KB 截断坏文件当成「已备份」永久跳过）
             await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .exporting) }
 
             let asset = PhotoLibraryService.fetchAssets(localIdentifiers: [item.assetLocalIdentifier]).first
@@ -336,6 +330,9 @@ final class UploadManager: ObservableObject {
             let exported = try await PhotoLibraryService.exportOriginal(asset: asset)
             defer { try? FileManager.default.removeItem(at: exported.fileURL) }
 
+            let localSize = (try? exported.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+                .map(Int64.init) ?? 0
+
             let remotePath = DatePath.remoteRelativePath(
                 fileName: item.fileName,
                 date: exported.creationDate ?? item.creationDate,
@@ -345,9 +342,19 @@ final class UploadManager: ObservableObject {
                 await MainActor.run { UploadManager.shared.updatePath(itemId: itemId, path: remotePath) }
             }
 
-            if skipExisting, try await client.remoteExists(relativePath: remotePath) {
-                await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
-                return
+            if skipExisting {
+                await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .checking) }
+                if let remoteSize = try await client.remoteByteSize(relativePath: remotePath) {
+                    // remoteSize == -1：存在但拿不到长度 → 保守跳过（与旧行为一致）
+                    // remoteSize >= 0：必须与本地一致才跳过，否则重新上传覆盖坏文件
+                    let sizeOK = remoteSize < 0 || (localSize > 0 && remoteSize == localSize)
+                        || (localSize == 0 && remoteSize == 0)
+                    if sizeOK {
+                        await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
+                        return
+                    }
+                    // 大小不符：继续上传覆盖（SFTP/WebDAV 均为 truncate/PUT 覆盖）
+                }
             }
 
             await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .uploading(progress: 0)) }

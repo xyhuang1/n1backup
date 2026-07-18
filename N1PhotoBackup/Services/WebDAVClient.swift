@@ -36,57 +36,122 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         session.finishTasksAndInvalidate()
     }
 
+    /// 连通性探测：路径不存在时尝试自动建目录；部分服务对 PROPFIND 返回 405 时改用 OPTIONS/HEAD。
     func testConnection() async throws {
-        _ = try await propfind(absolutePath: server.normalizedBasePath, depth: 0)
+        let base = server.normalizedBasePath
+
+        // 1) PROPFIND 目标路径（最标准）
+        do {
+            _ = try await propfind(absolutePath: base, depth: 0)
+            return
+        } catch let StorageError.httpStatus(code, _) where code == 404 {
+            // 路径尚不存在 → 逐级 MKCOL 后复测
+            try await ensureAbsoluteDirectories(base)
+            do {
+                _ = try await propfind(absolutePath: base, depth: 0)
+                return
+            } catch {
+                // 有的服务建完目录后 PROPFIND 仍 405，继续兜底
+            }
+        } catch StorageError.authFailed {
+            throw StorageError.authFailed
+        } catch let StorageError.httpStatus(code, _) where code == 405 || code == 501 {
+            // 服务不支持 PROPFIND，走 OPTIONS/HEAD
+        } catch {
+            // 其它错误留给后续 OPTIONS/HEAD 再确认是否「服务可达但方法受限」
+            // 若服务完全不可达，OPTIONS 也会同样失败
+            if case StorageError.transport = error { throw error }
+            if case StorageError.invalidConfiguration = error { throw error }
+        }
+
+        // 2) OPTIONS 探测服务是否可达 / 是否声明 WebDAV
+        if try await optionsReachable(absolutePath: base) { return }
+
+        // 3) HEAD / GET 兜底（部分反向代理禁 OPTIONS/PROPFIND）
+        if try await headOrGetReachable(absolutePath: base) { return }
+
+        // 4) 根可达但目标路径不通：尝试自动建目录后再测
+        if base != "/" {
+            let rootOK =
+                (try? await optionsReachable(absolutePath: "/")) == true
+                || (try? await headOrGetReachable(absolutePath: "/")) == true
+            if rootOK {
+                do {
+                    try await ensureAbsoluteDirectories(base)
+                    if try await optionsReachable(absolutePath: base) { return }
+                    if try await headOrGetReachable(absolutePath: base) { return }
+                    // MKCOL 未抛错：目录已建或已存在，上传阶段还会 ensureDirectories
+                    return
+                } catch {
+                    // 继续落到最终错误，附带建目录失败原因
+                    if let le = error as? LocalizedError, let d = le.errorDescription {
+                        throw StorageError.remote("WebDAV 路径不可用：\(d)")
+                    }
+                    throw error
+                }
+            }
+        }
+
+        throw StorageError.remote(
+            "WebDAV 探测失败。请检查：1) 主机/端口 2) 基础路径（AList 常含 /dav/...）3) 账号密码 4) HTTP/HTTPS 是否选对"
+        )
     }
 
-    func remoteExists(relativePath: String) async throws -> Bool {
+    func remoteByteSize(relativePath: String) async throws -> Int64? {
         let path = server.joinedRemotePath(relativePath)
         guard let url = makeURL(path: path) else { throw StorageError.invalidConfiguration("URL 无效") }
 
+        // 1) HEAD Content-Length
         let head = authorizedRequest(url: url, method: "HEAD")
         do {
-            let (_, response) = try await data(for: head, allowStatuses: [200, 204, 404, 405])
+            let (_, response) = try await data(for: head, allowStatuses: [200, 204, 301, 302, 404, 405, 501])
             if let http = response as? HTTPURLResponse {
-                if (200...299).contains(http.statusCode) { return true }
-                if http.statusCode == 404 { return false }
+                if http.statusCode == 404 { return nil }
+                if (200...299).contains(http.statusCode) {
+                    let len = http.value(forHTTPHeaderField: "Content-Length")
+                        .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+                    return len ?? -1
+                }
             }
         } catch {
             // fallthrough
         }
 
+        // 2) PROPFIND getcontentlength
         do {
             let xml = try await propfind(absolutePath: path, depth: 0)
             let lower = xml.lowercased()
-            return lower.contains("200 ok") || lower.contains("<d:href") || lower.contains("<d:multistatus")
+            let exists = lower.contains("200 ok") || lower.contains("<d:href") || lower.contains("<d:multistatus")
+            guard exists else { return nil }
+            if let size = Self.parseContentLength(from: xml) {
+                return size
+            }
+            return -1
         } catch let StorageError.httpStatus(code, _) where code == 404 {
-            return false
+            return nil
+        } catch let StorageError.httpStatus(code, _) where code == 405 || code == 501 {
+            // 无法列举时保守当作不存在，上传会覆盖/创建
+            return nil
         }
+    }
+
+    /// 从 PROPFIND XML 里抠 getcontentlength
+    private static func parseContentLength(from xml: String) -> Int64? {
+        // 兼容 <d:getcontentlength>123</d:getcontentlength> / <lp1:getcontentlength>…
+        let pattern = #"(?i)<[^>]*getcontentlength[^>]*>\s*(\d+)\s*</[^>]*getcontentlength>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(xml.startIndex..<xml.endIndex, in: xml)
+        guard let match = regex.firstMatch(in: xml, options: [], range: range),
+              match.numberOfRanges >= 2,
+              let r = Range(match.range(at: 1), in: xml) else {
+            return nil
+        }
+        return Int64(xml[r])
     }
 
     func ensureDirectories(relativeDir: String) async throws {
         let full = server.joinedRemotePath(relativeDir)
-        dirLock.lock()
-        let already = ensuredDirs.contains(full)
-        dirLock.unlock()
-        if already { return }
-
-        let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-        var built = ""
-        for part in parts {
-            built += "/" + part
-            dirLock.lock()
-            let known = ensuredDirs.contains(built)
-            dirLock.unlock()
-            if known { continue }
-            try await mkcol(absolutePath: built)
-            dirLock.lock()
-            ensuredDirs.insert(built)
-            dirLock.unlock()
-        }
-        dirLock.lock()
-        ensuredDirs.insert(full)
-        dirLock.unlock()
+        try await ensureAbsoluteDirectories(full)
     }
 
     func uploadFile(
@@ -116,16 +181,56 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
 
     // MARK: - WebDAV
 
+    private func ensureAbsoluteDirectories(_ full: String) async throws {
+        dirLock.lock()
+        let already = ensuredDirs.contains(full)
+        dirLock.unlock()
+        if already { return }
+
+        let parts = full.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+        var built = ""
+        for part in parts {
+            built += "/" + part
+            dirLock.lock()
+            let known = ensuredDirs.contains(built)
+            dirLock.unlock()
+            if known { continue }
+            try await mkcol(absolutePath: built)
+            dirLock.lock()
+            ensuredDirs.insert(built)
+            dirLock.unlock()
+        }
+        dirLock.lock()
+        ensuredDirs.insert(full)
+        dirLock.unlock()
+    }
+
     private func mkcol(absolutePath: String) async throws {
         guard let url = makeURL(path: absolutePath) else { throw StorageError.invalidConfiguration("URL 无效") }
         let request = authorizedRequest(url: url, method: "MKCOL")
-        let (_, response) = try await data(for: request, allowStatuses: [200, 201, 301, 302, 405, 409])
+        // 201 新建成功；200/301/302 已存在或重定向；405 方法不允许但资源常已存在；409 父目录不存在
+        let (_, response) = try await data(for: request, allowStatuses: [200, 201, 301, 302, 403, 405, 409])
         guard let http = response as? HTTPURLResponse else { return }
         if [201, 405, 200, 301, 302].contains(http.statusCode) { return }
         if http.statusCode == 409 {
+            // 父级可能刚建好但尚未可见，或路径已是文件；再 PROPFIND 看是否已存在
+            if await pathLooksPresent(absolutePath) { return }
             throw StorageError.remote("创建目录失败（父目录不存在）: \(absolutePath)")
         }
+        if http.statusCode == 403 {
+            if await pathLooksPresent(absolutePath) { return }
+            throw StorageError.remote("无权限创建目录: \(absolutePath)")
+        }
         throw StorageError.httpStatus(http.statusCode, nil)
+    }
+
+    private func pathLooksPresent(_ absolutePath: String) async -> Bool {
+        do {
+            _ = try await propfind(absolutePath: absolutePath, depth: 0)
+            return true
+        } catch {
+            return (try? await headOrGetReachable(absolutePath: absolutePath)) == true
+        }
     }
 
     private func propfind(absolutePath: String, depth: Int) async throws -> String {
@@ -140,14 +245,77 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         </d:propfind>
         """.utf8)
 
-        let (data, response) = try await data(for: request, allowStatuses: [200, 207, 404, 401, 403])
+        let (data, response) = try await data(for: request, allowStatuses: [200, 207, 404, 401, 403, 405, 501])
         guard let http = response as? HTTPURLResponse else { throw StorageError.remote("无响应") }
         if http.statusCode == 401 || http.statusCode == 403 { throw StorageError.authFailed }
         if http.statusCode == 404 { throw StorageError.httpStatus(404, nil) }
+        if http.statusCode == 405 || http.statusCode == 501 {
+            throw StorageError.httpStatus(http.statusCode, String(data: data, encoding: .utf8))
+        }
         if ![200, 207].contains(http.statusCode) {
             throw StorageError.httpStatus(http.statusCode, String(data: data, encoding: .utf8))
         }
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func optionsReachable(absolutePath: String) async throws -> Bool {
+        guard let url = makeURL(path: absolutePath) else { throw StorageError.invalidConfiguration("URL 无效") }
+        let request = authorizedRequest(url: url, method: "OPTIONS")
+        do {
+            let (_, response) = try await data(for: request, allowStatuses: [200, 204, 401, 403, 404, 405])
+            guard let http = response as? HTTPURLResponse else { return false }
+            if http.statusCode == 401 || http.statusCode == 403 { throw StorageError.authFailed }
+            if http.statusCode == 404 { return false }
+            // 任意 2xx/405 都说明 HTTP 服务可达；若声明 DAV 更佳
+            if let dav = http.value(forHTTPHeaderField: "DAV"), !dav.isEmpty { return true }
+            if let allow = http.value(forHTTPHeaderField: "Allow")?.uppercased(),
+               allow.contains("PUT") || allow.contains("MKCOL") || allow.contains("PROPFIND") {
+                return true
+            }
+            return (200...299).contains(http.statusCode) || http.statusCode == 405
+        } catch StorageError.authFailed {
+            throw StorageError.authFailed
+        } catch {
+            return false
+        }
+    }
+
+    private func headOrGetReachable(absolutePath: String) async throws -> Bool {
+        guard let url = makeURL(path: absolutePath) else { throw StorageError.invalidConfiguration("URL 无效") }
+
+        let head = authorizedRequest(url: url, method: "HEAD")
+        do {
+            let (_, response) = try await data(for: head, allowStatuses: [200, 204, 301, 302, 401, 403, 404, 405, 501])
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 401 || http.statusCode == 403 { throw StorageError.authFailed }
+                if (200...299).contains(http.statusCode) || http.statusCode == 301 || http.statusCode == 302 {
+                    return true
+                }
+            }
+        } catch StorageError.authFailed {
+            throw StorageError.authFailed
+        } catch {
+            // fallthrough to GET
+        }
+
+        // 部分服务禁 HEAD，用轻量 GET
+        var get = authorizedRequest(url: url, method: "GET")
+        get.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        do {
+            let (_, response) = try await data(for: get, allowStatuses: [200, 206, 301, 302, 401, 403, 404, 405, 416])
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 401 || http.statusCode == 403 { throw StorageError.authFailed }
+                if http.statusCode == 404 { return false }
+                return (200...299).contains(http.statusCode)
+                    || http.statusCode == 301 || http.statusCode == 302
+                    || http.statusCode == 416
+            }
+        } catch StorageError.authFailed {
+            throw StorageError.authFailed
+        } catch {
+            return false
+        }
+        return false
     }
 
     // MARK: - HTTP
@@ -155,18 +323,44 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
     private func makeURL(path: String) -> URL? {
         var components = URLComponents()
         components.scheme = server.useTLS ? "https" : "http"
-        components.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        components.host = Self.sanitizeHost(server.host)
         let port = server.port > 0 ? server.port : (server.useTLS ? 443 : 80)
         components.port = port
         let normalized = path.hasPrefix("/") ? path : "/" + path
+        // 分段编码，保留 /；中文与空格等会被 percent-encode
         components.percentEncodedPath = normalized
             .split(separator: "/", omittingEmptySubsequences: false)
             .map { seg -> String in
                 if seg.isEmpty { return "" }
-                return seg.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String(seg)
+                // urlPathAllowed 过宽，显式排除保留字以免路径段被拆坏
+                var allowed = CharacterSet.urlPathAllowed
+                allowed.remove(charactersIn: "/?#[]@!$&'()*+,;=")
+                return seg.addingPercentEncoding(withAllowedCharacters: allowed) ?? String(seg)
             }
             .joined(separator: "/")
         return components.url
+    }
+
+    /// 去掉用户误填的 scheme / 路径 / 空白
+    static func sanitizeHost(_ raw: String) -> String {
+        var h = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if h.hasPrefix("https://") {
+            h = String(h.dropFirst("https://".count))
+        } else if h.hasPrefix("http://") {
+            h = String(h.dropFirst("http://".count))
+        }
+        if let slash = h.firstIndex(of: "/") {
+            h = String(h[..<slash])
+        }
+        if let at = h.firstIndex(of: "@") {
+            h = String(h[h.index(after: at)...])
+        }
+        // host:port 时只留 host（端口用独立字段）
+        if h.contains(":"), !h.contains("]"), let colon = h.lastIndex(of: ":"),
+           h[h.index(after: colon)...].allSatisfy(\.isNumber) {
+            h = String(h[..<colon])
+        }
+        return h.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func authorizedRequest(url: URL, method: String) -> URLRequest {
@@ -177,6 +371,8 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
             let token = Data(raw.utf8).base64EncodedString()
             request.setValue("Basic \(token)", forHTTPHeaderField: "Authorization")
         }
+        // 部分 AList/反向代理对缺 User-Agent 不友好
+        request.setValue("N1PhotoBackup/1.7", forHTTPHeaderField: "User-Agent")
         return request
     }
 

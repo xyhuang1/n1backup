@@ -185,7 +185,7 @@ struct ServerEditView: View {
             case .sftp:
                 Text("SSH 用户可见的绝对路径，如 /mnt/sda1/PhoneBackup。请先 mkdir 并确保可写。")
             case .webdav:
-                Text("AList 示例：/dav/本地存储/PhoneBackup ；通用 WebDAV 多为 /PhoneBackup。路径须可写。")
+                Text("AList 示例：/dav/本地存储/PhoneBackup 。路径不存在时测试连接会尝试自动创建；须可写。主机只填 IP，不要带 http://。")
             }
         }
     }
@@ -242,10 +242,12 @@ struct ServerEditView: View {
             ]
         case .webdav:
             return [
-                "主机：N1 局域网 IP",
-                "端口：AList 默认 5244",
-                "用户名/密码：WebDAV 服务账号",
-                "基础路径：可写目录，如 /dav/本地存储/PhoneBackup",
+                "主机：只填 IP，如 192.168.1.10（不要写 http://）",
+                "端口：AList 默认 5244（与 AList 设置里 WebDAV 端口一致）",
+                "用户名/密码：AList / WebDAV 账号",
+                "基础路径：/dav/存储名/PhoneBackup（存储名与 AList 里一致）",
+                "若提示 404：路径未建好，测试会尝试自动创建",
+                "若提示 405：多半路径不是 WebDAV 根，检查 /dav 前缀与端口",
                 "内网自签 HTTPS：开 HTTPS 并勾选忽略证书"
             ]
         }
@@ -254,15 +256,39 @@ struct ServerEditView: View {
     // MARK: - Actions
 
     private func save(andDismiss: Bool) {
-        server.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        server.name = server.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        server.basePath = server.basePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if server.port <= 0 { server.port = server.protocolKind.defaultPort }
+        normalizeFields()
         serverStore.upsert(server, credentials: credentials)
         if andDismiss { dismiss() }
     }
 
+    /// 清理主机/路径常见误填（scheme、尾斜杠、空白）
+    private func normalizeFields() {
+        server.host = server.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        server.name = server.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        server.basePath = server.basePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        server.username = server.username.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if server.protocolKind == .webdav {
+            server.host = WebDAVStorageClient.sanitizeHost(server.host)
+            // 若用户把完整 URL 贴进「基础路径」则拆出 path
+            if server.basePath.lowercased().hasPrefix("http://")
+                || server.basePath.lowercased().hasPrefix("https://"),
+               let url = URL(string: server.basePath) {
+                if let host = url.host, server.host.isEmpty { server.host = host }
+                if let port = url.port, server.port <= 0 { server.port = port }
+                server.basePath = url.path.isEmpty ? "/" : url.path
+                if url.scheme?.lowercased() == "https" { server.useTLS = true }
+            }
+            if !server.basePath.hasPrefix("/") && !server.basePath.isEmpty {
+                server.basePath = "/" + server.basePath
+            }
+        }
+
+        if server.port <= 0 { server.port = server.protocolKind.defaultPort }
+    }
+
     private func test() async {
+        normalizeFields()
         save(andDismiss: false)
         isTesting = true
         testMessage = nil

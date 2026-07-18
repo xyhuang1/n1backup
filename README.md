@@ -83,6 +83,9 @@ N1PhotoBackup/
 1. 浏览器或电脑先测 `http://IP:端口/路径`  
 2. 确认用户可写、基础路径正确（含 `/dav/...`）  
 3. HTTPS 自签时勾选「忽略证书校验」  
+4. **HTTP 404**：路径不存在。v1.7.1+ 测试连接会尝试自动 `MKCOL` 建目录；仍失败则检查 AList 存储名与 `/dav` 前缀  
+5. **HTTP 405**：方法不被允许。常见原因是主机/端口指到了非 WebDAV 端点，或路径少了 `/dav`；主机只填 IP，不要带 `http://`  
+6. AList：设置 → WebDAV，端口默认 5244，路径形如 `/dav/本地存储/PhoneBackup`  
 
 ## License
 

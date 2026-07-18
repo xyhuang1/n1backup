@@ -17,6 +17,8 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     private var ensuredDirs = Set<String>()
 
     /// 分块大小：过大占内存且进度粗；过小 SFTP 往返多。256KB 对 N1 局域网较均衡。
+    /// 注意：Citadel `SFTPFile.write(_:at:)` 默认 at=0，分块循环必须显式传 offset，
+    /// 否则每一块都覆盖写到文件开头，远端文件永远只有最后一块（常见症状：全是 256KB 坏文件）。
     private let chunkSize = 256 * 1024
     private let maxOpRetries = 3
 
@@ -48,21 +50,26 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
         }
     }
 
-    func remoteExists(relativePath: String) async throws -> Bool {
+    func remoteByteSize(relativePath: String) async throws -> Int64? {
         try await withConnectionRetry {
             try await self.gate.run { [self] in
                 let path = normalized(server.joinedRemotePath(relativePath))
                 let sftp = try await ensureSFTP()
                 do {
-                    _ = try await sftp.getAttributes(at: path)
-                    return true
+                    let attrs = try await sftp.getAttributes(at: path)
+                    if let size = attrs.size {
+                        return Int64(size)
+                    }
+                    // 有的服务端不回 size 标志位，但路径存在 → 视为 0 以外的未知存在
+                    // 用 -1 表示「存在但未知大小」，调用方应回退为仅按存在跳过
+                    return -1
                 } catch {
                     // 属性查询失败多数是「不存在」；若像断连则向上抛出以便重连
                     if Self.looksLikeConnectionError(error) {
                         await tearDown()
                         throw StorageError.connectionFailed(friendly(error))
                     }
-                    return false
+                    return nil
                 }
             }
         }
@@ -128,16 +135,38 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
                             progress?(1)
                             return
                         }
+                        // Citadel write 默认 offset=0，不会像本地文件句柄那样自动 seek。
+                        // 必须把字节偏移传给 at:，否则每块都从 0 覆盖 → 远端恒为 chunk 大小。
                         var offset = 0
                         while offset < fileData.count {
                             let end = min(offset + chunkSize, fileData.count)
                             let slice = fileData[offset..<end]
                             var buffer = ByteBufferAllocator().buffer(capacity: slice.count)
                             buffer.writeBytes(slice)
-                            try await file.write(buffer)
+                            try await file.write(buffer, at: UInt64(offset))
                             offset = end
                             let p = Double(offset) / Double(max(fileData.count, 1))
                             progress?(min(max(p, 0.01), 0.99))
+                        }
+                    }
+
+                    // 上传后校验远端大小，尽早发现截断/覆盖写错误，避免标记为成功
+                    if size > 0 {
+                        do {
+                            let remoteAttrs = try await sftp.getAttributes(at: path)
+                            if let remoteSize = remoteAttrs.size, remoteSize != UInt64(size) {
+                                throw StorageError.remote(
+                                    "远端文件大小不符：期望 \(size) 字节，实际 \(remoteSize) 字节（路径 \(path)）。请重试该文件"
+                                )
+                            }
+                        } catch let e as StorageError {
+                            throw e
+                        } catch {
+                            // 属性查询失败不阻断（部分服务 stat 不稳定），但已尽量校验
+                            if Self.looksLikeConnectionError(error) {
+                                await tearDown()
+                                throw StorageError.connectionFailed(friendly(error))
+                            }
                         }
                     }
                     progress?(1)
