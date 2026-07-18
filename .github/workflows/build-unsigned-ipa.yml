@@ -174,12 +174,12 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### 未签名 IPA（v1.7.2 · SFTP + WebDAV）"
+            echo "### 未签名 IPA（v1.7.3 · SFTP + WebDAV）"
             echo ""
             echo "1. 下载 **N1PhotoBackup-unsigned-ipa**"
             echo "2. 解压得到 \`N1PhotoBackup-unsigned.ipa\`"
             echo "3. 牛蛙助手导入证书签名安装"
             echo "4. Bundle ID：\`${BUNDLE_ID}\`"
             echo "5. iOS **17+**；协议：SFTP（Citadel 静态）/ WebDAV"
-            echo "6. **1.7.2**：修复 SFTP 分块写 offset 导致远端恒 256KB 损坏"
+            echo "6. **1.7.3**：上传提速 — 小文件整文件 write、SFTP 并发封顶 3、导出限流、skip 先于 export"
           } >> "$GITHUB_STEP_SUMMARY"

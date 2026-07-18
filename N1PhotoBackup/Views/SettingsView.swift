@@ -67,7 +67,7 @@ struct SettingsView: View {
                 } header: {
                     Text("上传选项")
                 } footer: {
-                    Text("每路独立连接，持续取任务。SFTP 建议 2–3；WebDAV 可试 4–6。常亮仅在上传进行中生效。")
+                    Text("每路独立连接。SFTP 实际最多 3 路（再高 N1 常更慢）；WebDAV 可试 4–6。相册导出最多同时 2 路。常亮仅在上传进行中生效。")
                 }
 
                 Section("N1 / iStoreOS") {
@@ -82,7 +82,7 @@ struct SettingsView: View {
                 Section("关于") {
                     LabeledContent("应用", value: "N1 相册备份")
                     LabeledContent("协议", value: "SFTP · WebDAV")
-                    LabeledContent("版本", value: "1.7.0")
+                    LabeledContent("版本", value: "1.7.3")
                 }
             }
             .navigationTitle("设置")

@@ -19,7 +19,7 @@ final class UploadManager: ObservableObject {
     @Published private(set) var speedText: String = "—"
 
     /// 并发上传路数（每路独立连接）。1–6，默认 3。
-    /// SFTP 在 N1/Dropbear 上并发过高易断连；WebDAV 可适当调高。
+    /// SFTP 在 N1/Dropbear 上并发过高易断连且总吞吐常下降；运行时会再把 SFTP 封顶到 3。
     @Published var maxConcurrentUploads: Int {
         didSet {
             let clamped = Self.clampConcurrency(maxConcurrentUploads)
@@ -30,6 +30,9 @@ final class UploadManager: ObservableObject {
             UserDefaults.standard.set(clamped, forKey: Self.concurrencyKey)
         }
     }
+
+    /// SFTP 实际并发上限（即使用户滑到 6，N1 Dropbear 也按此封顶）
+    static let sftpEffectiveMaxConcurrency = 3
 
     /// 备份运行时保持屏幕常亮（默认开）
     @Published var keepScreenOn: Bool {
@@ -215,9 +218,13 @@ final class UploadManager: ObservableObject {
             return
         }
         let credentials = ServerStore.shared.credentials(for: server)
-        let concurrency = Self.clampConcurrency(maxConcurrentUploads)
+        var concurrency = Self.clampConcurrency(maxConcurrentUploads)
+        // SFTP：6 路常压垮 Dropbear，总吞吐更差；实际 worker 数封顶
+        if server.protocolKind == .sftp {
+            concurrency = min(concurrency, Self.sftpEffectiveMaxConcurrency)
+        }
         // SFTP 需要错开建连；WebDAV 可并行立刻开
-        let staggerNs: UInt64 = server.protocolKind == .sftp ? 500_000_000 : 80_000_000
+        let staggerNs: UInt64 = server.protocolKind == .sftp ? 350_000_000 : 50_000_000
 
         await withTaskGroup(of: Void.self) { group in
             for workerIndex in 0..<concurrency {
@@ -317,8 +324,21 @@ final class UploadManager: ObservableObject {
         let itemId = item.id
 
         do {
-            // 先导出再决定是否跳过：需要本地真实字节数与远端比对
-            // （旧逻辑只看路径是否存在，会把 256KB 截断坏文件当成「已备份」永久跳过）
+            // 路径先按入队时信息确定（creationDate 已在 enqueue 写入），避免为了 skip 检查先整文件导出。
+            var remotePath = item.remoteRelativePath
+
+            // 1) 快速路径：只看远端是否存在（不比对 size）。
+            //    完整正确的文件会被跳过；历史上 256KB 截断坏文件用户通常已手动清理。
+            //    若仍有坏文件残留，关掉「跳过已存在」或删掉远端后重传即可。
+            if skipExisting {
+                await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .checking) }
+                if try await client.remoteExists(relativePath: remotePath) {
+                    await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
+                    return
+                }
+            }
+
+            // 2) 导出原图/原视频（耗时；放在 skip 之后。ExportGate 最多 2 路同时导出）
             await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .exporting) }
 
             let asset = PhotoLibraryService.fetchAssets(localIdentifiers: [item.assetLocalIdentifier]).first
@@ -327,33 +347,23 @@ final class UploadManager: ObservableObject {
                 return
             }
 
-            let exported = try await PhotoLibraryService.exportOriginal(asset: asset)
+            let exported = try await ExportGate.shared.withPermit {
+                try await PhotoLibraryService.exportOriginal(asset: asset)
+            }
             defer { try? FileManager.default.removeItem(at: exported.fileURL) }
 
-            let localSize = (try? exported.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                .map(Int64.init) ?? 0
-
-            let remotePath = DatePath.remoteRelativePath(
+            let refined = DatePath.remoteRelativePath(
                 fileName: item.fileName,
                 date: exported.creationDate ?? item.creationDate,
                 layout: server.folderLayout
             )
-            if remotePath != item.remoteRelativePath {
+            if refined != remotePath {
+                remotePath = refined
                 await MainActor.run { UploadManager.shared.updatePath(itemId: itemId, path: remotePath) }
-            }
-
-            if skipExisting {
-                await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .checking) }
-                if let remoteSize = try await client.remoteByteSize(relativePath: remotePath) {
-                    // remoteSize == -1：存在但拿不到长度 → 保守跳过（与旧行为一致）
-                    // remoteSize >= 0：必须与本地一致才跳过，否则重新上传覆盖坏文件
-                    let sizeOK = remoteSize < 0 || (localSize > 0 && remoteSize == localSize)
-                        || (localSize == 0 && remoteSize == 0)
-                    if sizeOK {
-                        await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
-                        return
-                    }
-                    // 大小不符：继续上传覆盖（SFTP/WebDAV 均为 truncate/PUT 覆盖）
+                // 路径变了再查一次，避免重复上传
+                if skipExisting, try await client.remoteExists(relativePath: remotePath) {
+                    await MainActor.run { UploadManager.shared.update(itemId: itemId, status: .skipped) }
+                    return
                 }
             }
 

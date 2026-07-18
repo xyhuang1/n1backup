@@ -16,10 +16,10 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
     private var sftp: SFTPClient?
     private var ensuredDirs = Set<String>()
 
-    /// 分块大小：过大占内存且进度粗；过小 SFTP 往返多。256KB 对 N1 局域网较均衡。
-    /// 注意：Citadel `SFTPFile.write(_:at:)` 默认 at=0，分块循环必须显式传 offset，
-    /// 否则每一块都覆盖写到文件开头，远端文件永远只有最后一块（常见症状：全是 256KB 坏文件）。
-    private let chunkSize = 256 * 1024
+    /// 大文件才在客户端再分块（用于进度）；小文件一次 `write(at:0)`，由 Citadel 内部按 ≤32KB 发完。
+    /// **必须**显式传 `at:`：默认 0，若错误地对每块都用默认 offset，远端会恒为最后一块大小。
+    private let clientChunkThreshold = 4 * 1024 * 1024
+    private let clientChunkSize = 2 * 1024 * 1024
     private let maxOpRetries = 3
 
     init(server: StorageServer, credentials: ServerCredentials) {
@@ -135,38 +135,30 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
                             progress?(1)
                             return
                         }
-                        // Citadel write 默认 offset=0，不会像本地文件句柄那样自动 seek。
-                        // 必须把字节偏移传给 at:，否则每块都从 0 覆盖 → 远端恒为 chunk 大小。
-                        var offset = 0
-                        let chunk = self.chunkSize
-                        while offset < fileData.count {
-                            let end = min(offset + chunk, fileData.count)
-                            let slice = fileData[offset..<end]
-                            var buffer = ByteBufferAllocator().buffer(capacity: slice.count)
-                            buffer.writeBytes(slice)
-                            try await file.write(buffer, at: UInt64(offset))
-                            offset = end
-                            let p = Double(offset) / Double(max(fileData.count, 1))
-                            progress?(min(max(p, 0.01), 0.99))
-                        }
-                    }
-
-                    // 上传后校验远端大小，尽早发现截断/覆盖写错误，避免标记为成功
-                    if size > 0 {
-                        do {
-                            let remoteAttrs = try await sftp.getAttributes(at: path)
-                            if let remoteSize = remoteAttrs.size, remoteSize != UInt64(size) {
-                                throw StorageError.remote(
-                                    "远端文件大小不符：期望 \(size) 字节，实际 \(remoteSize) 字节（路径 \(path)）。请重试该文件"
-                                )
-                            }
-                        } catch let e as StorageError {
-                            throw e
-                        } catch {
-                            // 属性查询失败不阻断（部分服务 stat 不稳定），但已尽量校验
-                            if Self.looksLikeConnectionError(error) {
-                                await tearDown()
-                                throw StorageError.connectionFailed(friendly(error))
+                        // 小文件：一次 write(at:0)。Citadel 内部会按 ≤32KB 切片并推进 offset，
+                        // 与 v1.6.0 整文件路径一致，比我们自己再套一层 256KB 循环少很多 await。
+                        // 大文件（视频）：客户端按 2MB 分块并显式 at:offset，以便进度与控内存。
+                        if fileData.count <= self.clientChunkThreshold {
+                            progress?(0.05)
+                            var buffer = ByteBufferAllocator().buffer(capacity: fileData.count)
+                            buffer.writeBytes(fileData)
+                            try await file.write(buffer, at: 0)
+                        } else {
+                            var offset = 0
+                            let chunk = self.clientChunkSize
+                            var lastReported = 0.0
+                            while offset < fileData.count {
+                                let end = min(offset + chunk, fileData.count)
+                                let slice = fileData[offset..<end]
+                                var buffer = ByteBufferAllocator().buffer(capacity: slice.count)
+                                buffer.writeBytes(slice)
+                                try await file.write(buffer, at: UInt64(offset))
+                                offset = end
+                                let p = Double(offset) / Double(max(fileData.count, 1))
+                                if p - lastReported >= 0.08 || offset >= fileData.count {
+                                    lastReported = p
+                                    progress?(min(max(p, 0.01), 0.99))
+                                }
                             }
                         }
                     }

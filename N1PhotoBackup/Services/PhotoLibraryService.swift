@@ -29,6 +29,48 @@ struct ExportedAsset {
     let creationDate: Date?
 }
 
+/// 限制同时从相册导出的路数，避免多 worker 把 Photos I/O 打满导致更慢。
+/// 许可在 acquire/release 间传递：有等待者时 release 直接唤醒，不先减 running。
+actor ExportGate {
+    static let shared = ExportGate()
+    private let maxConcurrent = 2
+    private var running = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// 持有许可执行 body，结束后自动释放（含抛错路径）。
+    func withPermit<T: Sendable>(_ body: @Sendable () async throws -> T) async rethrows -> T {
+        await acquire()
+        do {
+            let value = try await body()
+            release()
+            return value
+        } catch {
+            release()
+            throw error
+        }
+    }
+
+    private func acquire() async {
+        if running < maxConcurrent {
+            running += 1
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            waiters.append(cont)
+        }
+        // resume 时已继承 release 让出的槽位，running 不变
+    }
+
+    private func release() {
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.resume()
+            return
+        }
+        running = max(0, running - 1)
+    }
+}
+
 enum PhotoLibraryService {
     static func requestAuthorization() async -> PHAuthorizationStatus {
         await withCheckedContinuation { cont in
