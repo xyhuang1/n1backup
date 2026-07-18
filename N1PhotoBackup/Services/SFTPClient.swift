@@ -138,8 +138,9 @@ final class SFTPStorageClient: StorageClient, @unchecked Sendable {
                         // Citadel write 默认 offset=0，不会像本地文件句柄那样自动 seek。
                         // 必须把字节偏移传给 at:，否则每块都从 0 覆盖 → 远端恒为 chunk 大小。
                         var offset = 0
+                        let chunk = self.chunkSize
                         while offset < fileData.count {
-                            let end = min(offset + chunkSize, fileData.count)
+                            let end = min(offset + chunk, fileData.count)
                             let slice = fileData[offset..<end]
                             var buffer = ByteBufferAllocator().buffer(capacity: slice.count)
                             buffer.writeBytes(slice)

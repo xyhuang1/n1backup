@@ -71,10 +71,16 @@ final class WebDAVStorageClient: NSObject, StorageClient, URLSessionTaskDelegate
         if try await headOrGetReachable(absolutePath: base) { return }
 
         // 4) 根可达但目标路径不通：尝试自动建目录后再测
+        // 注意：不能把 await 写进 `||` 短路表达式（Swift 会报 not support concurrency）
         if base != "/" {
-            let rootOK =
-                (try? await optionsReachable(absolutePath: "/")) == true
-                || (try? await headOrGetReachable(absolutePath: "/")) == true
+            let rootOK: Bool
+            if (try? await optionsReachable(absolutePath: "/")) == true {
+                rootOK = true
+            } else if (try? await headOrGetReachable(absolutePath: "/")) == true {
+                rootOK = true
+            } else {
+                rootOK = false
+            }
             if rootOK {
                 do {
                     try await ensureAbsoluteDirectories(base)
